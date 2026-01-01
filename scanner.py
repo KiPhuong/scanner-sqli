@@ -1,32 +1,26 @@
-"""scanner.py
+"""scanner.py (context-aware)
 
-scanner-sqli main orchestrator.
+Main orchestrator for the context-aware SQLi scanner.
 
-This file is the ONLY orchestrator.
-- It wires together: crawler, baseline, requester, evaluator, RL agent, detector,
-  payload pool, payload encoder, logging.
-- It should not contain SQL logic, mutation logic, or ML model definitions.
+New RL-driven fuzzing loop:
+1) Pick a seed payload from the pool.
+2) Tokenize payload.
+3) Build valid actions (token_idx, mutation_id) based on token context.
+4) Agent selects among valid actions (epsilon-greedy).
+5) Apply mutation -> new payload.
+6) Send request, evaluate, update agent + detector.
+7) Continue mutation chain until detection / block / max_steps.
 
-CLI
-    python scanner.py -u http://target/item.php?id=1
-
-Output (pentest-friendly)
-[+] Vulnerable parameter found
-    URL: ...
-    Parameter: ...
-    Method: GET
-    Payload: ...
-    Mutation: ...
-    Detection: time-based|semantic|error
-    Requests used: N
-
-Note: Only test targets you own or have explicit permission to test.
+Debugging
+- Use --debug to print per-step loop details.
+- Use --debug-steps N to limit debug prints to first N steps per injection point.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from typing import Dict, List, Optional, Tuple
 
@@ -39,8 +33,9 @@ from core.evaluator import Evaluator
 from core.detector import SQLiDetector
 
 from payload.payload_pool import PayloadPool
-from payload.encoder import PayloadEncoder
-from payload.mutations import apply_mutation_by_id, mutation_ids
+from payload.mutations import apply_mutation, get_available_mutations
+from payload.mutations import registry as mutation_registry
+from payload.tokenizer import Token, default_tokenizer
 
 from rl.agent import Agent, AgentConfig
 
@@ -49,16 +44,11 @@ from utils.logger import PayloadEvent, PayloadLogger, now_ts
 
 InjectionPoint = Dict[str, object]
 Baseline = Dict[str, object]
+Action = Tuple[int, str]  # (token_idx, mutation_id)
 
 
 def _to_injection_point_obj(ip) -> InjectionPoint:
-    """Convert core.crawler.InjectionPoint dataclass to a plain dict."""
-    return {
-        "url": ip.url,
-        "method": ip.method,
-        "param": ip.param,
-        "base_value": ip.value,
-    }
+    return {"url": ip.url, "method": ip.method, "param": ip.param, "base_value": ip.value}
 
 
 def _baseline_to_obj(b: BaselineResponse) -> Baseline:
@@ -67,12 +57,11 @@ def _baseline_to_obj(b: BaselineResponse) -> Baseline:
         "time": b.elapsed,
         "length": b.length,
         "embedding": b.embedding,
-        "params": b.params,  # keep for requester
+        "params": b.params,
     }
 
 
 def _detection_method(evidence_summary: Dict[str, int]) -> str:
-    # Prefer strongest/most interpretable in this order
     if evidence_summary.get("time_based", 0) > 0:
         return "time-based"
     if evidence_summary.get("sql_error", 0) > 0:
@@ -89,50 +78,65 @@ def _print_finding(f: dict) -> None:
     print(f"    Parameter: {ip['param']}")
     print(f"    Method: {ip['method']}")
     print(f"    Payload: {f.get('payload', '')}")
-    print(f"    Mutation: {f.get('mutation', '')}")
     print(f"    Detection: {f.get('detection', 'unknown')}")
     print(f"    Requests used: {f.get('requests_used', 0)}")
 
 
+def _debug_print(
+    enabled: bool,
+    step: int,
+    max_steps_to_print: int,
+    msg: str,
+) -> None:
+    if not enabled:
+        return
+    if max_steps_to_print >= 0 and step >= max_steps_to_print:
+        return
+    print(msg)
+
+
+def _build_valid_actions(valid_actions_map: Dict[int, List[str]]) -> List[Action]:
+    actions: List[Action] = []
+    for idx, mids in valid_actions_map.items():
+        for mid in mids:
+            actions.append((idx, mid))
+    return actions
+
+
 def scan(
     target_url: str,
-    payload_csv: str = "data/sqli.csv",
-    max_steps: int = 30,
+    payload_csv: str = "data/payloads.csv",
+    max_steps: int = 50,
     timeout: int = 15,
     retries: int = 1,
-    epsilon: float = 0.25,
+    epsilon: float = 0.3,
     url_encode_payload: bool = False,
     seed: int = 1337,
     log_path: str = "logs/payload_events.jsonl",
     model_in: Optional[str] = None,
     model_out: Optional[str] = None,
+    debug: bool = False,
+    debug_steps: int = 10,
 ) -> List[dict]:
-    """Run scan(target_url) and return per-injection-point results."""
-
     rng = random.Random(seed)
 
-    # Shared HTTP session for stability (cookies/keep-alive)
     session = requests.Session()
-    session.headers.setdefault("User-Agent", "scanner-sqli/1.0")
+    session.headers.setdefault("User-Agent", "scanner-sqli/2.0")
 
-    # Shared components
     crawler = Crawler(timeout=timeout, session=session)
     requester = Requester(timeout=timeout, retries=retries, session=session)
     evaluator = Evaluator()
     payload_logger = PayloadLogger(out_path=log_path)
 
     pool = PayloadPool(payload_csv, seed=seed)
-    encoder = PayloadEncoder(dim=64)
 
-    muts = mutation_ids()  # mutation IDs are strings in this codebase
-    mut_index = {mid: i for i, mid in enumerate(muts)}
+    # RL init
+    muts = mutation_registry.ids()
 
-    # Discrete action space: (payload_id, mutation_id)
-    actions: List[Tuple[int, str]] = [(pid, mid) for pid in range(pool.size()) for mid in muts]
-
-    # RL state: payload_embedding + one_hot(mutation) + deltas/similarity/status/error
-    payload_emb_dim = encoder.dim
-    state_dim = payload_emb_dim + len(muts) + 5
+    # state_dim = one_hot(cur) + one_hot(prev) + one_hot(next) + [td, ld, ss, status]
+    # TokenType count is derived from tokenizer
+    token_type_dim = len(list(__import__("payload.tokenizer", fromlist=["TokenType"]).TokenType))
+    state_dim = (token_type_dim * 3) + 4
 
     agent_cfg = AgentConfig(
         state_dim=state_dim,
@@ -145,26 +149,20 @@ def scan(
         intrinsic_scale=0.1,
     )
 
-    agent = Agent(action_space=actions, config=agent_cfg)
+    agent = Agent(mutation_ids=muts, config=agent_cfg)
+    if model_in and os.path.exists(model_in):
+        agent = Agent.load_from_file(model_in, mutation_ids=muts, config=agent_cfg)
 
-    # Optional: load persisted model
-    if model_in:
-        agent = Agent.load_from_file(model_in, action_space=actions, config=agent_cfg, strict=True)
-
-    # --- Step 1: crawling ---
     raw_ips = crawler.crawl(target_url)
-    injection_points: List[InjectionPoint] = []
-    for ip in raw_ips:
-        ip_obj = _to_injection_point_obj(ip)
-        injection_points.append(ip_obj)
+    injection_points = [_to_injection_point_obj(ip) for ip in raw_ips]
 
     results: List[dict] = []
 
     for ip in injection_points:
-        # --- Step 2: baseline ---
+        # baseline
         try:
             baseline_resp = BaselineResponse.from_injection_point(
-                injection_point=type("IP", (), {
+                type("IP", (), {
                     "url": ip["url"],
                     "method": ip["method"],
                     "param": ip["param"],
@@ -174,190 +172,164 @@ def scan(
                 session=session,
             )
         except Exception:
-            # Skip if baseline fails
-            results.append(
-                {
-                    "injection_point": ip,
-                    "skipped": True,
-                    "reason": "baseline_failed",
-                }
-            )
+            results.append({"injection_point": ip, "skipped": True, "reason": "baseline_failed"})
             continue
 
         baseline_obj = _baseline_to_obj(baseline_resp)
 
-        # --- Step 3: RL context init (per injection point) ---
         detector = SQLiDetector()
-        # Reset agent hidden state if any (none in current agent)
         if agent.rnd is not None:
-            # Re-init RND stats for isolation
-            agent.rnd._stats = (0.0, 0.0, 0.0)  # type: ignore[attr-defined]
+            agent.rnd._stats = (0.0, 0.0, 0.0)  # reset per injection point
 
-        last_state_metrics = {
-            "delta_time": 0.0,
-            "delta_length": 0.0,
+        # seed payload
+        current_payload = pool.sample_payload()
+
+        last_metrics = {
+            "time_delta": 0.0,
+            "length_delta": 0.0,
             "semantic_similarity": 1.0,
-            "status_code": float(baseline_obj["status"]),
-            "error_flag": 0.0,
+            "status_code": int(baseline_obj["status"]),
         }
 
         requests_used = 0
-        trigger_payload: Optional[str] = None
-        trigger_mutation: Optional[str] = None
 
-        # Track last chosen action for deterministic state construction
-        last_action_mut_id: str = muts[0]
-        last_action_payload_emb: List[float] = [0.0] * payload_emb_dim
+        _debug_print(debug, 0, debug_steps, f"\n[DBG] Injection point: {ip['method']} {ip['url']} param={ip['param']}")
+        _debug_print(debug, 0, debug_steps, f"[DBG] Seed payload: {current_payload!r}")
 
-        # --- Step 4: RL-driven payload loop ---
-        for _step in range(max_steps):
-            # Deterministic control flow: pick action from a stable state vector
-            # representing the last observed outcome for this injection point.
-            # We must pick a mutation for one-hot encoding; use the *last* mutation
-            # (or the first in registry for step 0). This keeps the control flow
-            # deterministic and avoids random placeholders.
-            if _step == 0:
-                cur_mut_for_state = muts[0]
-                cur_payload_emb_for_state = [0.0] * payload_emb_dim
-            else:
-                cur_mut_for_state = last_action_mut_id  # type: ignore[name-defined]
-                cur_payload_emb_for_state = last_action_payload_emb  # type: ignore[name-defined]
+        for step in range(max_steps):
+            tokens: List[Token] = default_tokenizer.tokenize(current_payload)
 
-            state_vec = Agent.build_state(
-                payload_embedding=cur_payload_emb_for_state,
-                mutation_id=cur_mut_for_state,
-                mutation_id_to_index=mut_index,
-                time_delta=last_state_metrics["delta_time"],
-                length_delta=last_state_metrics["delta_length"],
-                semantic_similarity=last_state_metrics["semantic_similarity"],
-            ) + [
-                float(last_state_metrics["status_code"]),
-                float(last_state_metrics["error_flag"]),
-            ]
+            valid_actions_map = get_available_mutations(current_payload)
+            valid_actions = _build_valid_actions(valid_actions_map)
 
-            payload_id, mut_id = agent.select_action(state_vec)
+            _debug_print(debug, step, debug_steps, f"[DBG] step={step} tokens={len(tokens)} valid_actions={len(valid_actions)}")
 
-            base_payload = pool.get_payload_by_id(payload_id)
-            mutated_payload = apply_mutation_by_id(base_payload, mut_id, rng=rng)
+            if not valid_actions:
+                _debug_print(debug, step, debug_steps, "[DBG] No valid actions; stop.")
+                break
 
-            # send request
+            def state_builder(token_idx: int) -> List[float]:
+                return Agent.build_state(
+                    tokens=tokens,
+                    token_idx=token_idx,
+                    time_delta=last_metrics["time_delta"],
+                    length_delta=last_metrics["length_delta"],
+                    semantic_similarity=last_metrics["semantic_similarity"],
+                    status_code=last_metrics["status_code"],
+                )
+
+            token_idx, mutation_id = agent.select_action(valid_actions, state_builder)
+
+            tok_text = tokens[token_idx].text if 0 <= token_idx < len(tokens) else "?"
+            _debug_print(
+                debug,
+                step,
+                debug_steps,
+                f"[DBG] chosen: token_idx={token_idx} token={tok_text!r} mutation={mutation_id}",
+            )
+
+            new_payload = apply_mutation(current_payload, mutation_id, token_idx, rng=rng)
+            if not new_payload:
+                _debug_print(debug, step, debug_steps, "[DBG] mutation returned None; continue.")
+                continue
+
+            _debug_print(debug, step, debug_steps, f"[DBG] payload: {current_payload!r} -> {new_payload!r}")
+
             resp = requester.send(
                 url=str(ip["url"]),
                 method=str(ip["method"]),
                 params=dict(baseline_obj["params"]),
                 inject_param=str(ip["param"]),
-                payload=mutated_payload,
+                payload=new_payload,
                 url_encode_payload=url_encode_payload,
             )
             requests_used += 1
 
             eval_res = evaluator.evaluate(baseline_resp, resp)
-            detector.record_attempt(mutated_payload, eval_res)
+            detector.record_attempt(new_payload, eval_res)
 
-            # Build state/next_state for RL
-            payload_emb = encoder.encode(base_payload)
-            state = Agent.build_state(
-                payload_embedding=payload_emb,
-                mutation_id=mut_id,
-                mutation_id_to_index=mut_index,
-                time_delta=last_state_metrics["delta_time"],
-                length_delta=last_state_metrics["delta_length"],
-                semantic_similarity=last_state_metrics["semantic_similarity"],
-            ) + [
-                float(last_state_metrics["status_code"]),
-                float(last_state_metrics["error_flag"]),
-            ]
+            # next state/action list
+            next_tokens = default_tokenizer.tokenize(new_payload)
+            next_valid_actions = _build_valid_actions(get_available_mutations(new_payload))
 
-            next_state = Agent.build_state(
-                payload_embedding=payload_emb,
-                mutation_id=mut_id,
-                mutation_id_to_index=mut_index,
-                time_delta=eval_res.time_delta,
-                length_delta=float(eval_res.length_delta),
-                semantic_similarity=eval_res.semantic_similarity,
-            ) + [
-                float(resp.status_code),
-                1.0 if eval_res.sql_error else 0.0,
-            ]
-            
-            # Update last action for next step's state construction
-            last_action_mut_id = mut_id
-            last_action_payload_emb = payload_emb
+            def next_state_builder(next_token_idx: int) -> List[float]:
+                return Agent.build_state(
+                    tokens=next_tokens,
+                    token_idx=next_token_idx,
+                    time_delta=eval_res.time_delta,
+                    length_delta=float(eval_res.length_delta),
+                    semantic_similarity=eval_res.semantic_similarity,
+                    status_code=resp.status_code,
+                )
 
-            # update agent (extrinsic + intrinsic handled inside agent.observe)
-            agent.observe(
-                state=state,
-                action=(payload_id, mut_id),
+            done = bool(detector.verdict().vulnerable or eval_res.blocked)
+            total_reward = agent.observe(
+                state=state_builder(token_idx),
+                action=(token_idx, mutation_id),
                 extrinsic_reward=eval_res.reward,
-                next_state=next_state,
-                done=False,
+                next_valid_actions=next_valid_actions,
+                next_state_builder=next_state_builder,
+                done=done,
             )
 
-            # logging hook
+            _debug_print(
+                debug,
+                step,
+                debug_steps,
+                f"[DBG] resp: status={resp.status_code} tΔ={eval_res.time_delta:.3f}s lenΔ={eval_res.length_delta} sim={eval_res.semantic_similarity:.3f} sqlerr={eval_res.sql_error} blocked={eval_res.blocked} reward={eval_res.reward:.3f} total={total_reward:.3f}",
+            )
+
             payload_logger.log(
                 PayloadEvent(
                     ts=now_ts(),
-                    target_url=str(target_url),
+                    target_url=target_url,
                     injection_url=str(ip["url"]),
                     method=str(ip["method"]),
                     param=str(ip["param"]),
-                    payload_id=int(payload_id),
-                    mutation_id=str(mut_id),
-                    base_payload=base_payload,
-                    mutated_payload=mutated_payload,
+                    payload_id=-1,
+                    mutation_id=mutation_id,
+                    base_payload=current_payload,
+                    mutated_payload=new_payload,
                     reward=float(eval_res.reward),
                     time_delta=float(eval_res.time_delta),
                     length_delta=float(eval_res.length_delta),
                     semantic_similarity=float(eval_res.semantic_similarity),
                     sql_error=bool(eval_res.sql_error),
                     blocked=bool(eval_res.blocked),
-                    vulnerable=False,
+                    vulnerable=bool(detector.verdict().vulnerable),
                 )
             )
 
-            # termination conditions
-            if eval_res.blocked:
-                # Stop early if target blocks
-                break
-
-            last_state_metrics = {
-                "delta_time": float(eval_res.time_delta),
-                "delta_length": float(eval_res.length_delta),
+            current_payload = new_payload
+            last_metrics = {
+                "time_delta": float(eval_res.time_delta),
+                "length_delta": float(eval_res.length_delta),
                 "semantic_similarity": float(eval_res.semantic_similarity),
-                "status_code": float(resp.status_code),
-                "error_flag": 1.0 if eval_res.sql_error else 0.0,
+                "status_code": int(resp.status_code),
             }
 
-            det = detector.verdict()
-            if det.vulnerable:
-                trigger_payload = det.trigger_payloads[0] if det.trigger_payloads else mutated_payload
-                trigger_mutation = mut_id
+            if eval_res.blocked:
+                _debug_print(debug, step, debug_steps, "[DBG] blocked -> stop.")
+                break
+
+            if detector.verdict().vulnerable:
+                _debug_print(debug, step, debug_steps, "[DBG] vulnerable -> stop.")
                 break
 
         det = detector.verdict()
-        evidence_summary = det.evidence_summary
-
         results.append(
             {
                 "injection_point": ip,
-                "baseline": {
-                    "status": baseline_obj["status"],
-                    "time": baseline_obj["time"],
-                    "length": baseline_obj["length"],
-                },
                 "vulnerable": bool(det.vulnerable),
-                "payload": trigger_payload,
-                "mutation": trigger_mutation,
-                "detection": _detection_method(evidence_summary),
+                "payload": det.trigger_payloads[0] if det.trigger_payloads else None,
+                "detection": _detection_method(det.evidence_summary),
                 "requests_used": int(requests_used),
-                "evidence_summary": evidence_summary,
                 "trigger_payloads": det.trigger_payloads,
+                "evidence_summary": det.evidence_summary,
             }
         )
 
     payload_logger.flush()
-
-    # Optional: save model
     if model_out:
         agent.save(model_out)
 
@@ -365,18 +337,20 @@ def scan(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="scanner-sqli (black-box SQLi scanner)")
+    ap = argparse.ArgumentParser(description="scanner-sqli v2 (context-aware)")
     ap.add_argument("-u", "--url", required=True, help="Target URL")
-    ap.add_argument("--payload-csv", default="data/payloads.csv", help="CSV with query,label")
-    ap.add_argument("--max-steps", type=int, default=30, help="Max attempts per parameter")
-    ap.add_argument("--timeout", type=int, default=15, help="Request timeout (s)")
-    ap.add_argument("--retries", type=int, default=1, help="Retries per request")
-    ap.add_argument("--epsilon", type=float, default=0.25, help="Epsilon-greedy exploration")
-    ap.add_argument("--url-encode-payload", action="store_true", help="URL-encode payload before sending")
-    ap.add_argument("--seed", type=int, default=1337, help="PRNG seed")
-    ap.add_argument("--json", action="store_true", help="Output JSON")
-    ap.add_argument("--model-in", default=None, help="Load agent model from JSON")
-    ap.add_argument("--model-out", default=None, help="Save agent model to JSON")
+    ap.add_argument("--payload-csv", default="data/payloads.csv", help="CSV with seed payloads (query,label)")
+    ap.add_argument("--max-steps", type=int, default=50, help="Max mutation steps per injection point")
+    ap.add_argument("--timeout", type=int, default=15)
+    ap.add_argument("--retries", type=int, default=1)
+    ap.add_argument("--epsilon", type=float, default=0.3)
+    ap.add_argument("--url-encode-payload", action="store_true")
+    ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--model-in", default=None, help="Load context-aware agent model")
+    ap.add_argument("--model-out", default=None, help="Save context-aware agent model")
+    ap.add_argument("--debug", action="store_true", help="Print debug info for fuzzing loop")
+    ap.add_argument("--debug-steps", type=int, default=10, help="Max debug steps printed per injection point (-1 = all)")
 
     args = ap.parse_args()
 
@@ -391,13 +365,14 @@ def main() -> None:
         seed=args.seed,
         model_in=args.model_in,
         model_out=args.model_out,
+        debug=args.debug,
+        debug_steps=args.debug_steps,
     )
 
     if args.json:
         print(json.dumps({"target": args.url, "results": results}, indent=2, ensure_ascii=False))
         return
 
-    # Pentest-friendly summary
     vulns = [r for r in results if r.get("vulnerable")]
     if not vulns:
         print("[-] No SQLi findings detected.")

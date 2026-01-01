@@ -1,276 +1,218 @@
-"""payload.mutations
+"""payload.mutations (context-aware, token-level)
 
-Payload-level mutations for SQLi fuzzing.
+This module provides:
+- A lightweight mutation registry (string id -> function)
+- Token-level mutations that operate on a token list + token index
+- Context-aware filtering: only offer mutations that make sense for a token type
 
-Each mutation:
-- takes a full payload string
-- returns a modified payload string
+Important constraints
+- Mutations work at payload/chunk level (not character-by-character generation).
+- No SQL grammar is required; we use a lightweight tokenizer.
 
-Non-goals:
-- character-by-character generation
+Public functions used by scanner.py
+- get_available_mutations(payload) -> dict[token_idx] = [mutation_id,...]
+- apply_mutation(payload, mutation_id, token_idx, rng=...) -> new_payload|None
 
-Mutation categories implemented:
-- Keyword obfuscation (case randomization)
-- Comment injection (/**/)
-- Whitespace substitution (%0a, %09)
-- Operator substitution (AND→&&, OR→||)
-- Wrapper injection (quotes, parentheses)
-- Time-based transformation (e.g., OR 1=1 → OR SLEEP(5))
-
-Includes:
-- a mutation registry
-- apply_mutation_by_id
+The scanner orchestrator should:
+- build valid actions (token_idx, mutation_id) for the current payload
+- let the RL agent pick among those actions
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import random
-import re
 from typing import Callable, Dict, List, Optional
 
+from payload.context import ContextAwareMutations, MutationContext
+from payload.tokenizer import Token, TokenType, default_tokenizer
 
-MutationFn = Callable[[str, random.Random], str]
+
+TokenMutationFn = Callable[[List[Token], int, random.Random], Optional[List[Token]]]
 
 
 @dataclass(frozen=True)
 class Mutation:
     id: str
-    name: str
     description: str
-    fn: MutationFn
+    fn: TokenMutationFn
+
+
+class MutationRegistry:
+    def __init__(self) -> None:
+        self._muts: Dict[str, Mutation] = {}
+
+    def register(self, mutation_id: str, description: str) -> Callable[[TokenMutationFn], TokenMutationFn]:
+        def deco(fn: TokenMutationFn) -> TokenMutationFn:
+            self._muts[mutation_id] = Mutation(id=mutation_id, description=description, fn=fn)
+            return fn
+
+        return deco
+
+    def get(self, mutation_id: str) -> Mutation:
+        if mutation_id not in self._muts:
+            raise KeyError(f"Unknown mutation: {mutation_id}")
+        return self._muts[mutation_id]
+
+    def ids(self) -> List[str]:
+        return list(self._muts.keys())
+
+
+registry = MutationRegistry()
 
 
 # -------------------------
-# Helpers
-# -------------------------
-
-_SQL_KEYWORDS = [
-    "SELECT",
-    "UNION",
-    "WHERE",
-    "FROM",
-    "AND",
-    "OR",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "DROP",
-    "SLEEP",
-    "BENCHMARK",
-    "WAITFOR",
-    "DELAY",
-    "ORDER",
-    "GROUP",
-    "BY",
-    "HAVING",
-]
-
-
-def _randomize_case(s: str, rng: random.Random) -> str:
-    out = []
-    for ch in s:
-        if ch.isalpha():
-            out.append(ch.upper() if rng.random() < 0.5 else ch.lower())
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def _replace_word_boundary(payload: str, word: str, repl: str) -> str:
-    # (?i) for case-insensitive; \b for word boundary
-    pattern = re.compile(rf"(?i)\b{re.escape(word)}\b")
-    return pattern.sub(repl, payload)
-
-
-def _choose_ws(rng: random.Random) -> str:
-    return rng.choice(["%0a", "%09"])  # newline / tab
-
-
-def _inject_comment_in_spaces(payload: str, rng: random.Random) -> str:
-    # Replace some whitespace runs with /**/ (optionally combined with ws encodings)
-    def repl(_match: re.Match) -> str:
-        # Keep it readable but obfuscated
-        choices = ["/**/", f"/**/{_choose_ws(rng)}", f"{_choose_ws(rng)}/**/"]
-        return rng.choice(choices)
-
-    return re.sub(r"\s+", repl, payload)
-
-
-# -------------------------
-# Mutations
+# Token-level mutations
 # -------------------------
 
 
-def m_keyword_case_randomization(payload: str, rng: random.Random) -> str:
-    """Randomize case of common SQL keywords only (not the whole payload)."""
+@registry.register("randomize_case", "Randomize case of SQL keywords")
+def m_randomize_case(tokens: List[Token], token_idx: int, rng: random.Random) -> Optional[List[Token]]:
+    tok = tokens[token_idx]
+    if tok.type != TokenType.KEYWORD:
+        return None
 
-    out = payload
-    for kw in _SQL_KEYWORDS:
-        # Replace keyword occurrences with randomized-case variant.
-        def _kw_repl(m: re.Match) -> str:
-            return _randomize_case(m.group(0), rng)
+    text = tok.text
+    if len(text) <= 1:
+        return None
 
-        out = re.sub(rf"(?i)\b{re.escape(kw)}\b", _kw_repl, out)
+    new_text = "".join(ch.upper() if rng.random() < 0.5 else ch.lower() for ch in text)
+    if new_text == text:
+        return None
+
+    out = list(tokens)
+    out[token_idx] = Token(text=new_text, type=tok.type, start=tok.start)
     return out
 
 
-def m_comment_injection(payload: str, rng: random.Random) -> str:
-    """Inject /**/ into whitespace positions."""
-    return _inject_comment_in_spaces(payload, rng)
+@registry.register("change_to_hex", "Convert string literal to hex (0x...) or number to hex")
+def m_change_to_hex(tokens: List[Token], token_idx: int, rng: random.Random) -> Optional[List[Token]]:
+    _ = rng
+    tok = tokens[token_idx]
+
+    if tok.type == TokenType.LITERAL_STRING:
+        # Strip quotes and convert to hex bytes
+        if len(tok.text) < 2:
+            return None
+        content = tok.text[1:-1]
+        hex_str = "0x" + content.encode("utf-8", errors="ignore").hex()
+        out = list(tokens)
+        out[token_idx] = Token(text=hex_str, type=TokenType.LITERAL_NUMBER, start=tok.start)
+        return out
+
+    if tok.type == TokenType.LITERAL_NUMBER:
+        s = tok.text.strip().lower()
+        if s.startswith("0x"):
+            return None
+        try:
+            hex_str = hex(int(float(s)))
+        except ValueError:
+            return None
+        out = list(tokens)
+        out[token_idx] = Token(text=hex_str, type=TokenType.LITERAL_NUMBER, start=tok.start)
+        return out
+
+    return None
 
 
-def m_whitespace_substitution(payload: str, rng: random.Random) -> str:
-    """Replace some spaces with %0a or %09."""
-
-    # Replace spaces between non-space characters; keep leading/trailing as-is.
-    def repl(_match: re.Match) -> str:
-        return _choose_ws(rng)
-
-    # only replace literal spaces (not all whitespace) to avoid exploding transformations
-    return re.sub(r" +", repl, payload)
+@registry.register("add_comment_after", "Insert /**/ right after this token")
+def m_add_comment_after(tokens: List[Token], token_idx: int, rng: random.Random) -> Optional[List[Token]]:
+    _ = rng
+    out = list(tokens)
+    out.insert(token_idx + 1, Token(text="/**/", type=TokenType.COMMENT, start=out[token_idx].end))
+    return out
 
 
-def m_operator_substitution(payload: str, rng: random.Random) -> str:
-    """Substitute AND/OR operators."""
+@registry.register("wrap_with_comment", "Wrap token with /**/token/**/")
+def m_wrap_with_comment(tokens: List[Token], token_idx: int, rng: random.Random) -> Optional[List[Token]]:
+    _ = rng
+    tok = tokens[token_idx]
+    out = list(tokens)
+    out[token_idx: token_idx + 1] = [
+        Token(text="/**/", type=TokenType.COMMENT, start=tok.start),
+        tok,
+        Token(text="/**/", type=TokenType.COMMENT, start=tok.end),
+    ]
+    return out
 
-    out = payload
 
-    # Replace AND with && sometimes
-    if re.search(r"(?i)\bAND\b", out) and rng.random() < 0.9:
-        out = _replace_word_boundary(out, "AND", "&&")
+@registry.register("add_whitespace", "Add whitespace around token")
+def m_add_whitespace(tokens: List[Token], token_idx: int, rng: random.Random) -> Optional[List[Token]]:
+    ws = rng.choice([" ", "%0a", "%09"])
+    tok = tokens[token_idx]
+    out = list(tokens)
+    out[token_idx: token_idx + 1] = [
+        Token(text=ws, type=TokenType.WHITESPACE, start=tok.start),
+        tok,
+        Token(text=ws, type=TokenType.WHITESPACE, start=tok.end),
+    ]
+    return out
 
-    # Replace OR with || sometimes
-    if re.search(r"(?i)\bOR\b", out) and rng.random() < 0.9:
-        out = _replace_word_boundary(out, "OR", "||")
+
+@registry.register("add_sleep", "Replace OR/AND <cond> with OR/AND SLEEP(n)")
+def m_add_sleep(tokens: List[Token], token_idx: int, rng: random.Random) -> Optional[List[Token]]:
+    tok = tokens[token_idx]
+    if tok.type != TokenType.KEYWORD:
+        return None
+    if tok.text.upper() not in {"OR", "AND"}:
+        return None
+
+    n = rng.choice([3, 5, 7])
+    sleep = Token(text=f"SLEEP({n})", type=TokenType.KEYWORD, start=tok.end)
+
+    # Insert SLEEP(n) after OR/AND
+    out = list(tokens)
+    out.insert(token_idx + 1, Token(text=" ", type=TokenType.WHITESPACE, start=tok.end))
+    out.insert(token_idx + 2, sleep)
+    return out
+
+
+# -------------------------
+# Public helpers
+# -------------------------
+
+
+def get_available_mutations(payload: str) -> Dict[int, List[str]]:
+    """Return mapping token_idx -> list of valid mutation IDs for that token."""
+
+    tokens = default_tokenizer.tokenize(payload)
+    out: Dict[int, List[str]] = {}
+
+    for i, tok in enumerate(tokens):
+        ctx = MutationContext(
+            current_token=tok,
+            prev_token=tokens[i - 1] if i > 0 else None,
+            next_token=tokens[i + 1] if i + 1 < len(tokens) else None,
+            token_index=i,
+            all_tokens=tokens,
+        )
+        valid = ContextAwareMutations.get_valid_mutations(ctx)
+        # Only keep mutations that actually exist in registry
+        valid = [m for m in valid if m in registry.ids()]
+        if valid:
+            out[i] = sorted(valid)
 
     return out
 
 
-def m_wrapper_injection(payload: str, rng: random.Random) -> str:
-    """Wrap the entire payload with quotes/parentheses."""
-
-    wrappers = [
-        ("(", ")"),
-        ("'", "'"),
-        ('"', '"'),
-        ("')(", ")('") if rng.random() < 0.5 else ("'(", ")'"),
-    ]
-
-    left, right = rng.choice(wrappers)
-    return f"{left}{payload}{right}"
-
-
-def m_time_based_transformation(payload: str, rng: random.Random) -> str:
-    """Try to convert a boolean OR/AND condition into a time-based one.
-
-    Examples:
-    - OR 1=1  -> OR SLEEP(5)
-    - OR '1'='1' -> OR SLEEP(5)
-
-    If no simple pattern is found, append a time-based clause.
-    """
-
-    sleep_seconds = rng.choice([3, 5, 7])
-    sleep_expr = f"SLEEP({sleep_seconds})"
-
-    # Replace common always-true patterns when preceded by OR/AND
-    patterns = [
-        r"(?i)(\bOR\b)\s+1\s*=\s*1\b",
-        r"(?i)(\bOR\b)\s+'1'\s*=\s*'1'\b",
-        r"(?i)(\bOR\b)\s+\"1\"\s*=\s*\"1\"\b",
-        r"(?i)(\bAND\b)\s+1\s*=\s*1\b",
-        r"(?i)(\bAND\b)\s+'1'\s*=\s*'1'\b",
-        r"(?i)(\bAND\b)\s+\"1\"\s*=\s*\"1\"\b",
-    ]
-
-    for pat in patterns:
-        if re.search(pat, payload):
-            return re.sub(pat, lambda m: f"{m.group(1)} {sleep_expr}", payload)
-
-    # If no match: add a time-based clause in a conservative way
-    if re.search(r"(?i)\bOR\b", payload):
-        return re.sub(r"(?i)\bOR\b", lambda m: f"{m.group(0)} {sleep_expr} OR", payload, count=1).rstrip(" OR")
-    if re.search(r"(?i)\bAND\b", payload):
-        return re.sub(r"(?i)\bAND\b", lambda m: f"{m.group(0)} {sleep_expr} AND", payload, count=1).rstrip(" AND")
-
-    # Fallback append
-    joiner = " OR " if rng.random() < 0.5 else " AND "
-    return f"{payload}{joiner}{sleep_expr}"
-
-
-# -------------------------
-# Registry
-# -------------------------
-
-
-MUTATIONS: List[Mutation] = [
-    Mutation(
-        id="kw_case",
-        name="Keyword case randomization",
-        description="Randomize case of common SQL keywords.",
-        fn=m_keyword_case_randomization,
-    ),
-    Mutation(
-        id="comment_inject",
-        name="Comment injection",
-        description="Replace whitespace with /**/ (and variants).",
-        fn=m_comment_injection,
-    ),
-    Mutation(
-        id="ws_sub",
-        name="Whitespace substitution",
-        description="Replace spaces with %0a or %09.",
-        fn=m_whitespace_substitution,
-    ),
-    Mutation(
-        id="op_sub",
-        name="Operator substitution",
-        description="Replace AND/OR with &&/||.",
-        fn=m_operator_substitution,
-    ),
-    Mutation(
-        id="wrap",
-        name="Wrapper injection",
-        description="Wrap payload with quotes/parentheses.",
-        fn=m_wrapper_injection,
-    ),
-    Mutation(
-        id="time",
-        name="Time-based transformation",
-        description="Transform boolean conditions into SLEEP(n) time-based clauses.",
-        fn=m_time_based_transformation,
-    ),
-]
-
-_MUTATION_BY_ID: Dict[str, Mutation] = {m.id: m for m in MUTATIONS}
-
-
-def mutation_ids() -> List[str]:
-    return [m.id for m in MUTATIONS]
-
-
-def get_mutation(mutation_id: str) -> Mutation:
-    try:
-        return _MUTATION_BY_ID[mutation_id]
-    except KeyError as e:
-        raise KeyError(f"Unknown mutation id: {mutation_id}. Known: {mutation_ids()}") from e
-
-
-def apply_mutation_by_id(
+def apply_mutation(
     payload: str,
     mutation_id: str,
-    seed: Optional[int] = None,
+    token_idx: int,
     rng: Optional[random.Random] = None,
-) -> str:
-    """Apply a mutation by ID.
+) -> Optional[str]:
+    """Apply token-level mutation. Returns new payload or None if not applicable."""
 
-    Provide either seed or rng.
-    """
+    rng = rng or random.Random()
 
-    if rng is None:
-        rng = random.Random(seed)
+    tokens = default_tokenizer.tokenize(payload)
+    if token_idx < 0 or token_idx >= len(tokens):
+        return None
 
-    mut = get_mutation(mutation_id)
-    return mut.fn(payload, rng)
+    mut = registry.get(mutation_id)
+    new_tokens = mut.fn(tokens, token_idx, rng)
+    if not new_tokens:
+        return None
 
+    # Reconstruct payload from tokens
+    return "".join(t.text for t in new_tokens)
