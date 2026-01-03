@@ -11,10 +11,11 @@ State Representation
   plus global response metrics.
 
 Q-Function
-- We use a linear Q-function per mutation type: Q(s, m) = w_m · s
-- This means the agent learns a weight vector for each mutation ID.
-- To select an action, it computes Q-values for all valid (token, mutation)
-  pairs and picks the best one via epsilon-greedy.
+- Linear Q per mutation type: Q(s, m) = w_m · s
+
+Stability / exploration
+- We break tie-bias by initializing weights with small random values.
+- Epsilon-greedy is used for exploration.
 """
 
 from __future__ import annotations
@@ -31,16 +32,15 @@ from rl.replay_buffer import ReplayBuffer, Transition
 from rl.rnd import RND
 
 
-# Action is now context-aware: (token_index, mutation_id)
-Action = Tuple[int, str]
+Action = Tuple[int, str]  # (token_idx, mutation_id)
 
 
 def _dot(a: List[float], b: List[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
 
 
-def _zeros(n: int) -> List[float]:
-    return [0.0] * n
+def _rand_small(rng: random.Random, n: int, scale: float = 1e-3) -> List[float]:
+    return [rng.uniform(-scale, scale) for _ in range(n)]
 
 
 @dataclass
@@ -48,7 +48,7 @@ class AgentConfig:
     state_dim: int
     gamma: float = 0.95
     lr: float = 0.05
-    epsilon: float = 0.2
+    epsilon: float = 0.3
     replay_capacity: int = 50_000
     batch_size: int = 64
     use_rnd: bool = True
@@ -70,9 +70,9 @@ class Agent:
         self.policy = EpsilonGreedyPolicy(epsilon=config.epsilon, seed=config.seed)
         self.replay = ReplayBuffer(capacity=config.replay_capacity, seed=config.seed)
 
-        # One weight vector per MUTATION type
+        # One weight vector per MUTATION type. Small random init reduces greedy tie-bias.
         self.weights: List[List[float]] = [
-            _zeros(self.cfg.state_dim) for _ in range(len(self.mutation_ids))
+            _rand_small(self._rng, self.cfg.state_dim) for _ in range(len(self.mutation_ids))
         ]
 
         self.rnd: Optional[RND] = None
@@ -86,7 +86,7 @@ class Agent:
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         payload = {
-            "version": 2,  # Context-aware agent
+            "version": 2,
             "state_dim": self.cfg.state_dim,
             "mutation_ids": self.mutation_ids,
             "weights": self.weights,
@@ -121,34 +121,33 @@ class Agent:
     def build_state(
         tokens: List[Token],
         token_idx: int,
-        # response/evaluator signals
         time_delta: float,
         length_delta: float,
         semantic_similarity: float,
         status_code: int,
     ) -> List[float]:
-        """Create a flat state vector for a specific token's context."""
         tok = tokens[token_idx]
         prev_tok = tokens[token_idx - 1] if token_idx > 0 else None
         next_tok = tokens[token_idx + 1] if token_idx + 1 < len(tokens) else None
 
-        # Token type embeddings (one-hot)
-        tok_type_emb = [0.0] * len(TokenType)
-        tok_type_emb[list(TokenType).index(tok.type)] = 1.0
+        enum_vals = list(TokenType)
+        dim = len(enum_vals)
 
-        prev_type_emb = [0.0] * len(TokenType)
-        if prev_tok:
-            prev_type_emb[list(TokenType).index(prev_tok.type)] = 1.0
+        def one_hot(t: Optional[Token]) -> List[float]:
+            v = [0.0] * dim
+            if t is None:
+                return v
+            v[enum_vals.index(t.type)] = 1.0
+            return v
 
-        next_type_emb = [0.0] * len(TokenType)
-        if next_tok:
-            next_type_emb[list(TokenType).index(next_tok.type)] = 1.0
+        tok_type_emb = one_hot(tok)
+        prev_type_emb = one_hot(prev_tok)
+        next_type_emb = one_hot(next_tok)
 
-        # Simple scaling/clamping
         td = max(-30.0, min(30.0, float(time_delta)))
         ld = max(-1e6, min(1e6, float(length_delta)))
         ss = max(0.0, min(1.0, float(semantic_similarity)))
-        sc = float(status_code) / 1000.0  # Normalize status
+        sc = float(status_code) / 1000.0
 
         return tok_type_emb + prev_type_emb + next_type_emb + [td, ld, ss, sc]
 
@@ -157,16 +156,15 @@ class Agent:
     # -------------------------
 
     def select_action(self, valid_actions: List[Action], state_builder) -> Action:
-        """Select the best (token_idx, mutation_id) from a valid list."""
+        if not valid_actions:
+            raise ValueError("valid_actions is empty")
 
-        q_values = []
+        q_values: List[float] = []
         for token_idx, mutation_id in valid_actions:
-            state = state_builder(token_idx)
-            mut_idx = self.mutation_index[mutation_id]
-            q = _dot(self.weights[mut_idx], state)
-            q_values.append(q)
+            s = state_builder(token_idx)
+            m_idx = self.mutation_index[mutation_id]
+            q_values.append(_dot(self.weights[m_idx], s))
 
-        # Epsilon-greedy selection on the indices of valid_actions
         chosen_idx = self.policy.select(q_values)
         return valid_actions[chosen_idx]
 
@@ -185,50 +183,51 @@ class Agent:
     ) -> float:
         intrinsic = 0.0
         if self.rnd is not None:
-            # RND novelty is based on the state that was acted upon
             intrinsic = self.rnd.update(state)
 
         total_reward = float(extrinsic_reward + self.cfg.intrinsic_scale * intrinsic)
 
-        # For replay buffer, we need a stable next_state vector.
-        # We compute max_a' Q(s', a') now and store it as part of the transition.
         if done or not next_valid_actions:
             max_next_q = 0.0
         else:
             next_qs = []
-            for token_idx, mutation_id in next_valid_actions:
-                next_s = next_state_builder(token_idx)
-                mut_idx = self.mutation_index[mutation_id]
-                next_qs.append(_dot(self.weights[mut_idx], next_s))
-            max_next_q = max(next_qs)
+            for next_token_idx, mutation_id in next_valid_actions:
+                s2 = next_state_builder(next_token_idx)
+                m_idx = self.mutation_index[mutation_id]
+                next_qs.append(_dot(self.weights[m_idx], s2))
+            max_next_q = max(next_qs) if next_qs else 0.0
 
-        # We store the max_next_q directly, simplifying the learning step.
-        # The `next_state` in the buffer is just the state that was acted upon.
+        # store max_next_q in next_state to keep Transition type unchanged
         self.replay.push(
-            Transition(state=state, action=action, reward=total_reward, next_state=[max_next_q], done=done)
+            Transition(
+                state=list(state),
+                action=action,
+                reward=total_reward,
+                next_state=[float(max_next_q)],
+                done=bool(done),
+            )
         )
 
         self.learn()
         return total_reward
 
     def learn(self) -> None:
-        if len(self.replay) < self.cfg.batch_size:
+        if len(self.replay) < max(1, self.cfg.batch_size):
             return
 
         batch = self.replay.sample(self.cfg.batch_size)
         for tr in batch:
             _token_idx, mutation_id = tr.action
-            mut_idx = self.mutation_index.get(mutation_id)
-            if mut_idx is None:
+            m_idx = self.mutation_index.get(mutation_id)
+            if m_idx is None:
                 continue
 
-            q_sa = _dot(self.weights[mut_idx], tr.state)
-            max_next_q = tr.next_state[0]
-
+            q_sa = _dot(self.weights[m_idx], tr.state)
+            max_next_q = float(tr.next_state[0]) if tr.next_state else 0.0
             target = tr.reward + self.cfg.gamma * max_next_q
             td_err = target - q_sa
 
-            # SGD update
-            w = self.weights[mut_idx]
+            w = self.weights[m_idx]
+            lr = self.cfg.lr
             for i in range(self.cfg.state_dim):
-                w[i] += self.cfg.lr * td_err * tr.state[i]
+                w[i] += lr * td_err * tr.state[i]
