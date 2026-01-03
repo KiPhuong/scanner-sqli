@@ -1,19 +1,28 @@
-"""scanner.py (context-aware)
+"""scanner.py (sqlmap-driven RL)
 
-Main orchestrator for the context-aware SQLi scanner.
+This project has been refactored to use sqlmap as the execution backend.
 
-New RL-driven fuzzing loop:
-1) Pick a seed payload from the pool.
-2) Tokenize payload.
-3) Build valid actions (token_idx, mutation_id) based on token context.
-4) Agent selects among valid actions (epsilon-greedy).
-5) Apply mutation -> new payload.
-6) Send request, evaluate, update agent + detector.
-7) Continue mutation chain until detection / block / max_steps.
+One RL step = one sqlmap execution.
+Episode ends when:
+- sqlmap confirms an injectable parameter, OR
+- max_steps reached (default 15)
 
-Debugging
-- Use --debug to print per-step loop details.
-- Use --debug-steps N to limit debug prints to first N steps per injection point.
+The RL agent selects *atomic* configuration options (e.g., set technique,
+set level/risk, add a tamper, etc.). Those options are accumulated into a
+persistent SqlmapConfig, rendered into a sqlmap command, and executed.
+
+Output/report includes:
+- url
+- vulnerable parameter
+- exploited payload (best-effort parsed from sqlmap output)
+- RL-generated payload: the sqlmap command that led to the result
+
+State features include:
+- last run observation flags (injectable/blocked/timeout)
+- normalized last run duration
+- normalized episode index (within episodes_per_input)
+- technique history mask (which techniques have been tried in this episode)
+- current sqlmap config (technique/level/risk/timing/tampers/...)
 """
 
 from __future__ import annotations
@@ -21,365 +30,452 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
-from typing import Dict, List, Optional, Tuple
+import time
+import uuid
+from dataclasses import asdict
+from typing import Dict, List, Optional, Set
 
 import requests
 
 from core.crawler import Crawler
-from core.baseline import BaselineResponse
-from core.requester import Requester
-from core.evaluator import Evaluator
-from core.detector import SQLiDetector
-
-from payload.payload_pool import PayloadPool
-from payload.mutations import apply_mutation, get_available_mutations
-from payload.mutations import registry as mutation_registry
-from payload.tokenizer import Token, default_tokenizer
+from core.sqlmap_evaluator import RewardConfig, compute_reward
+from core.sqlmap_parser import SqlmapObservation, parse_sqlmap_output
+from core.sqlmap_runner import SqlmapRunConfig, SqlmapRunner, SqlmapTarget
 
 from rl.agent import Agent, AgentConfig
-
-from utils.logger import PayloadEvent, PayloadLogger, now_ts
+from rl.sqlmap_config import SqlmapConfig, apply_option, to_sqlmap_args
+from rl.sqlmap_option_space import OptionAction, default_option_actions
 
 
 InjectionPoint = Dict[str, object]
-Baseline = Dict[str, object]
-Action = Tuple[int, str]  # (token_idx, mutation_id)
 
 
 def _to_injection_point_obj(ip) -> InjectionPoint:
     return {"url": ip.url, "method": ip.method, "param": ip.param, "base_value": ip.value}
 
 
-def _baseline_to_obj(b: BaselineResponse) -> Baseline:
-    return {
-        "status": b.status_code,
-        "time": b.elapsed,
-        "length": b.length,
-        "embedding": b.embedding,
-        "params": b.params,
-    }
+def _one_hot(idx: int, dim: int) -> List[float]:
+    v = [0.0] * dim
+    if 0 <= idx < dim:
+        v[idx] = 1.0
+    return v
 
 
-def _detection_method(evidence_summary: Dict[str, int]) -> str:
-    if evidence_summary.get("time_based", 0) > 0:
-        return "time-based"
-    if evidence_summary.get("sql_error", 0) > 0:
-        return "error"
-    if evidence_summary.get("semantic_dev", 0) > 0:
-        return "semantic"
-    return "unknown"
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
-def _print_finding(f: dict) -> None:
-    ip = f["injection_point"]
-    print("[+] Vulnerable parameter found")
-    print(f"    URL: {ip['url']}")
-    print(f"    Parameter: {ip['param']}")
-    print(f"    Method: {ip['method']}")
-    print(f"    Payload: {f.get('payload', '')}")
-    print(f"    Detection: {f.get('detection', 'unknown')}")
-    print(f"    Requests used: {f.get('requests_used', 0)}")
+def build_state(
+    obs: Optional[SqlmapObservation],
+    cfg: SqlmapConfig,
+    *,
+    action_space: List[OptionAction],
+    steps_left: int,
+    last_duration_sec: float,
+    episode_index: int,
+    episodes_per_input: int,
+    tried_techniques: Set[str],
+) -> List[float]:
+    """Build a fixed-size state vector from last observation + history + current config."""
 
+    # --- observation features
+    if obs is None:
+        injectable = 0.0
+        blocked = 0.0
+        timeout = 0.0
+    else:
+        injectable = 1.0 if obs.injectable else 0.0
+        blocked = 1.0 if obs.blocked else 0.0
+        timeout = 1.0 if obs.timeout else 0.0
 
-def _debug_print(
-    enabled: bool,
-    step: int,
-    max_steps_to_print: int,
-    msg: str,
-) -> None:
-    if not enabled:
-        return
-    if max_steps_to_print >= 0 and step >= max_steps_to_print:
-        return
-    print(msg)
+    # steps_left normalized to [0,1]
+    steps_left_norm = _clamp(steps_left / 15.0, 0.0, 1.0)
 
+    # last duration normalized (proxy for request cost)
+    # clip to 0..timeout_sec-like range; we normalize by 120s here for stability
+    last_dur_norm = _clamp(float(last_duration_sec) / 120.0, 0.0, 1.0)
 
-def _build_valid_actions(valid_actions_map: Dict[int, List[str]]) -> List[Action]:
-    actions: List[Action] = []
-    for idx, mids in valid_actions_map.items():
-        for mid in mids:
-            actions.append((idx, mid))
-    return actions
+    # episode index normalized within [0,1]
+    denom = max(1, int(episodes_per_input) - 1)
+    ep_norm = _clamp(float(episode_index) / float(denom), 0.0, 1.0)
+
+    # technique history mask (what we've tried in this episode)
+    # (same space as technique_list below, excluding "")
+    tried_list = ["B", "E", "T", "U", "BE", "BT", "ET", "BET"]
+    tried_mask = [1.0 if t in tried_techniques else 0.0 for t in tried_list]
+
+    # --- config features
+    technique_list = ["", "B", "E", "T", "U", "BE", "BT", "ET", "BET"]
+    tech_idx = technique_list.index(cfg.technique) if cfg.technique in technique_list else 0
+    tech_oh = _one_hot(tech_idx, len(technique_list))
+
+    level_list = [1, 3, 5]
+    lvl_idx = level_list.index(cfg.level) if cfg.level in level_list else 0
+    lvl_oh = _one_hot(lvl_idx, len(level_list))
+
+    risk_list = [1, 2, 3]
+    risk_idx = risk_list.index(cfg.risk) if cfg.risk in risk_list else 0
+    risk_oh = _one_hot(risk_idx, len(risk_list))
+
+    delay_bins = [None, 0.0, 0.5, 1.0]
+    d_idx = delay_bins.index(cfg.delay) if cfg.delay in delay_bins else 0
+    delay_oh = _one_hot(d_idx, len(delay_bins))
+
+    time_bins = [None, 3, 5, 8, 10]
+    ts_idx = time_bins.index(cfg.time_sec) if cfg.time_sec in time_bins else 0
+    time_oh = _one_hot(ts_idx, len(time_bins))
+
+    # tamper multi-hot over tampers present in action space
+    tamper_names = sorted({a.value for a in action_space if a.kind == "add_tamper" and a.value})
+    tamper_flags = [1.0 if t in cfg.tampers else 0.0 for t in tamper_names]
+
+    # --- additional config features
+    ra = [1.0 if cfg.random_agent else 0.0]
+
+    timeout_bins = [None, 10, 20, 30, 60]
+    to_idx = timeout_bins.index(cfg.timeout) if cfg.timeout in timeout_bins else 0
+    timeout_oh = _one_hot(to_idx, len(timeout_bins))
+
+    retries_bins = [None, 0, 1, 2, 3]
+    r_idx = retries_bins.index(cfg.retries) if cfg.retries in retries_bins else 0
+    retries_oh = _one_hot(r_idx, len(retries_bins))
+
+    return (
+        [injectable, blocked, timeout, steps_left_norm, last_dur_norm, ep_norm]
+        + tried_mask
+        + tech_oh
+        + lvl_oh
+        + risk_oh
+        + delay_oh
+        + time_oh
+        + ra
+        + timeout_oh
+        + retries_oh
+        + tamper_flags
+    )
 
 
 def scan(
     target_url: str,
-    payload_csv: str = "data/payloads.csv",
-    max_steps: int = 50,
-    timeout: int = 15,
-    retries: int = 1,
+    *,
+    max_steps: int = 15,
+    episodes_per_input: int = 1,
+    timeout_sec: int = 120,
     epsilon: float = 0.3,
-    url_encode_payload: bool = False,
     seed: int = 1337,
-    log_path: str = "logs/payload_events.jsonl",
     model_in: Optional[str] = None,
     model_out: Optional[str] = None,
-    debug: bool = False,
-    debug_steps: int = 10,
+    json_output: bool = False,
+    debug_log: Optional[str] = None,
 ) -> List[dict]:
-    rng = random.Random(seed)
-
     session = requests.Session()
-    session.headers.setdefault("User-Agent", "scanner-sqli/2.0")
+    session.headers.setdefault("User-Agent", "scanner-sqli-sqlmap-rl/1.0")
 
-    crawler = Crawler(timeout=timeout, session=session)
-    requester = Requester(timeout=timeout, retries=retries, session=session)
-    evaluator = Evaluator()
-    payload_logger = PayloadLogger(out_path=log_path)
+    crawler = Crawler(timeout=15, session=session)
 
-    pool = PayloadPool(payload_csv, seed=seed)
+    # tampers to allow (small, practical set; expand later if you want)
+    # Note: we keep action space small to make sequential option learning feasible.
+    allowed_tampers = [
+        "randomcase",
+        "space2comment",
+        "between",
+        "charencode",
+        "equaltolike",
+        "space2plus",
+    ]
 
-    # RL init
-    muts = mutation_registry.ids()
+    action_space = default_option_actions(allowed_tampers)
+    action_ids = list(range(len(action_space)))
 
-    # state_dim = one_hot(cur) + one_hot(prev) + one_hot(next) + [td, ld, ss, status]
-    # TokenType count is derived from tokenizer
-    token_type_dim = len(list(__import__("payload.tokenizer", fromlist=["TokenType"]).TokenType))
-    state_dim = (token_type_dim * 3) + 4
+    # Build a dummy state to get state_dim
+    dummy_cfg = SqlmapConfig()
+    dummy_state = build_state(
+        None,
+        dummy_cfg,
+        action_space=action_space,
+        steps_left=max_steps,
+        last_duration_sec=0.0,
+        episode_index=0,
+        episodes_per_input=episodes_per_input,
+        tried_techniques=set(),
+    )
+    state_dim = len(dummy_state)
 
     agent_cfg = AgentConfig(
         state_dim=state_dim,
         epsilon=epsilon,
         seed=seed,
-        lr=0.03,
-        gamma=0.9,
+        lr=0.05,
+        gamma=0.95,
         batch_size=64,
         use_rnd=True,
-        intrinsic_scale=0.1,
+        intrinsic_scale=0.05,
     )
 
-    agent = Agent(mutation_ids=muts, config=agent_cfg)
+    agent = Agent(action_ids=action_ids, config=agent_cfg)
     if model_in and os.path.exists(model_in):
-        agent = Agent.load_from_file(model_in, mutation_ids=muts, config=agent_cfg)
+        agent = Agent.load_from_file(model_in, action_ids=action_ids, config=agent_cfg)
+
+    runner = SqlmapRunner(
+        SqlmapRunConfig(
+            timeout_sec=timeout_sec,
+            threads=1,
+            batch=True,
+            flush_session=True,
+            output_root="logs/sqlmap_runs",
+            verbosity=1,
+            # Always-on knobs to reduce noise and request cost in detection phase
+            # --forms: parse forms for parameters
+            # --smart: only run thorough tests if heuristics are positive
+            # --skip-static: skip non-dynamic parameters
+            extra_args=["--forms", "--smart", "--skip-static"],
+        )
+    )
+
+    reward_cfg = RewardConfig()
 
     raw_ips = crawler.crawl(target_url)
     injection_points = [_to_injection_point_obj(ip) for ip in raw_ips]
 
     results: List[dict] = []
 
+    # Optional debug logging (JSONL)
+    debug_f = None
+    if debug_log:
+        os.makedirs("debug", exist_ok=True)
+        path = debug_log
+        if path.lower() in {"1", "true", "yes", "on"}:
+            path = os.path.join("debug", f"debug_{int(time.time())}.jsonl")
+        elif not os.path.isabs(path):
+            # Treat relative as inside ./debug
+            path = os.path.join("debug", path)
+
+        debug_f = open(path, "a", encoding="utf-8")
+
     for ip in injection_points:
-        # baseline
-        try:
-            baseline_resp = BaselineResponse.from_injection_point(
-                type("IP", (), {
-                    "url": ip["url"],
-                    "method": ip["method"],
-                    "param": ip["param"],
-                    "value": ip["base_value"],
-                })(),
-                timeout=timeout,
-                session=session,
-            )
-        except Exception:
-            results.append({"injection_point": ip, "skipped": True, "reason": "baseline_failed"})
-            continue
+        # Auto-train loop: run N episodes for this injection point and stop early on injectable
+        ip_found = False
 
-        baseline_obj = _baseline_to_obj(baseline_resp)
+        # Keep last_obs for reporting in case of no-find
+        last_obs_for_ip: Optional[SqlmapObservation] = None
 
-        detector = SQLiDetector()
-        if agent.rnd is not None:
-            agent.rnd._stats = (0.0, 0.0, 0.0)  # reset per injection point
+        for ep in range(max(1, int(episodes_per_input))):
+            episode_id = str(uuid.uuid4())
+            cfg = SqlmapConfig()
+            last_obs: Optional[SqlmapObservation] = None
+            last_duration = 0.0
+            total_duration = 0.0
 
-        # seed payload
-        current_payload = pool.sample_payload()
+            tried_techniques: Set[str] = set()
 
-        last_metrics = {
-            "time_delta": 0.0,
-            "length_delta": 0.0,
-            "semantic_similarity": 1.0,
-            "status_code": int(baseline_obj["status"]),
-        }
+            for step in range(max_steps):
+                # Update history before selecting action (based on current cfg)
+                if cfg.technique:
+                    tried_techniques.add(cfg.technique)
 
-        requests_used = 0
-
-        _debug_print(debug, 0, debug_steps, f"\n[DBG] Injection point: {ip['method']} {ip['url']} param={ip['param']}")
-        _debug_print(debug, 0, debug_steps, f"[DBG] Seed payload: {current_payload!r}")
-
-        for step in range(max_steps):
-            tokens: List[Token] = default_tokenizer.tokenize(current_payload)
-
-            valid_actions_map = get_available_mutations(current_payload)
-            valid_actions = _build_valid_actions(valid_actions_map)
-
-            _debug_print(debug, step, debug_steps, f"[DBG] step={step} tokens={len(tokens)} valid_actions={len(valid_actions)}")
-
-            if not valid_actions:
-                _debug_print(debug, step, debug_steps, "[DBG] No valid actions; stop.")
-                break
-
-            def state_builder(token_idx: int) -> List[float]:
-                return Agent.build_state(
-                    tokens=tokens,
-                    token_idx=token_idx,
-                    time_delta=last_metrics["time_delta"],
-                    length_delta=last_metrics["length_delta"],
-                    semantic_similarity=last_metrics["semantic_similarity"],
-                    status_code=last_metrics["status_code"],
+                state = build_state(
+                    last_obs,
+                    cfg,
+                    action_space=action_space,
+                    steps_left=(max_steps - step),
+                    last_duration_sec=last_duration,
+                    episode_index=ep,
+                    episodes_per_input=episodes_per_input,
+                    tried_techniques=tried_techniques,
                 )
 
-            token_idx, mutation_id = agent.select_action(valid_actions, state_builder)
+                # Choose one atomic option
+                action_id = agent.select_action(action_ids, state)
+                act = action_space[action_id]
 
-            tok_text = tokens[token_idx].text if 0 <= token_idx < len(tokens) else "?"
-            _debug_print(
-                debug,
-                step,
-                debug_steps,
-                f"[DBG] chosen: token_idx={token_idx} token={tok_text!r} mutation={mutation_id}",
-            )
+                apply_option(cfg, act, max_tampers=15)
 
-            new_payload = apply_mutation(current_payload, mutation_id, token_idx, rng=rng)
-            if not new_payload:
-                _debug_print(debug, step, debug_steps, "[DBG] mutation returned None; continue.")
-                continue
+                # Track technique history after applying technique updates too
+                if cfg.technique:
+                    tried_techniques.add(cfg.technique)
 
-            _debug_print(debug, step, debug_steps, f"[DBG] payload: {current_payload!r} -> {new_payload!r}")
+                argv_opts = to_sqlmap_args(cfg)
 
-            resp = requester.send(
-                url=str(ip["url"]),
-                method=str(ip["method"]),
-                params=dict(baseline_obj["params"]),
-                inject_param=str(ip["param"]),
-                payload=new_payload,
-                url_encode_payload=url_encode_payload,
-            )
-            requests_used += 1
+                target = SqlmapTarget(url=str(ip["url"]), method=str(ip["method"]))
+                run_res = runner.run(target=target, argv_options=argv_opts)
 
-            eval_res = evaluator.evaluate(baseline_resp, resp)
-            detector.record_attempt(new_payload, eval_res)
+                last_duration = float(run_res.duration_sec)
+                total_duration += float(run_res.duration_sec)
 
-            # next state/action list
-            next_tokens = default_tokenizer.tokenize(new_payload)
-            next_valid_actions = _build_valid_actions(get_available_mutations(new_payload))
-
-            def next_state_builder(next_token_idx: int) -> List[float]:
-                return Agent.build_state(
-                    tokens=next_tokens,
-                    token_idx=next_token_idx,
-                    time_delta=eval_res.time_delta,
-                    length_delta=float(eval_res.length_delta),
-                    semantic_similarity=eval_res.semantic_similarity,
-                    status_code=resp.status_code,
+                obs = parse_sqlmap_output(
+                    run_res.stdout,
+                    run_res.stderr,
+                    timed_out=run_res.timed_out,
                 )
+                reward = compute_reward(obs, duration_sec=run_res.duration_sec, cfg=reward_cfg)
 
-            done = bool(detector.verdict().vulnerable or eval_res.blocked)
-            total_reward = agent.observe(
-                state=state_builder(token_idx),
-                action=(token_idx, mutation_id),
-                extrinsic_reward=eval_res.reward,
-                next_valid_actions=next_valid_actions,
-                next_state_builder=next_state_builder,
-                done=done,
-            )
-
-            _debug_print(
-                debug,
-                step,
-                debug_steps,
-                f"[DBG] resp: status={resp.status_code} tΔ={eval_res.time_delta:.3f}s lenΔ={eval_res.length_delta} sim={eval_res.semantic_similarity:.3f} sqlerr={eval_res.sql_error} blocked={eval_res.blocked} reward={eval_res.reward:.3f} total={total_reward:.3f}",
-            )
-
-            payload_logger.log(
-                PayloadEvent(
-                    ts=now_ts(),
-                    target_url=target_url,
-                    injection_url=str(ip["url"]),
-                    method=str(ip["method"]),
-                    param=str(ip["param"]),
-                    payload_id=-1,
-                    mutation_id=mutation_id,
-                    base_payload=current_payload,
-                    mutated_payload=new_payload,
-                    reward=float(eval_res.reward),
-                    time_delta=float(eval_res.time_delta),
-                    length_delta=float(eval_res.length_delta),
-                    semantic_similarity=float(eval_res.semantic_similarity),
-                    sql_error=bool(eval_res.sql_error),
-                    blocked=bool(eval_res.blocked),
-                    vulnerable=bool(detector.verdict().vulnerable),
+                next_state = build_state(
+                    obs,
+                    cfg,
+                    action_space=action_space,
+                    steps_left=(max_steps - step - 1),
+                    last_duration_sec=last_duration,
+                    episode_index=ep,
+                    episodes_per_input=episodes_per_input,
+                    tried_techniques=tried_techniques,
                 )
-            )
+                done = bool(obs.injectable or (step == max_steps - 1))
 
-            current_payload = new_payload
-            last_metrics = {
-                "time_delta": float(eval_res.time_delta),
-                "length_delta": float(eval_res.length_delta),
-                "semantic_similarity": float(eval_res.semantic_similarity),
-                "status_code": int(resp.status_code),
-            }
+                total_reward = agent.observe(state=state, action=action_id, reward=reward, next_state=next_state, done=done)
 
-            if eval_res.blocked:
-                _debug_print(debug, step, debug_steps, "[DBG] blocked -> stop.")
+                if debug_f is not None:
+                    dbg = {
+                        "ts": time.time(),
+                        "target": target_url,
+                        "injection_url": str(ip["url"]),
+                        "method": str(ip["method"]),
+                        "injection_param": str(ip.get("param", "")),
+                        "episode_id": episode_id,
+                        "episode_index": ep,
+                        "step": step,
+                        "action_id": int(action_id),
+                        "action": {"kind": act.kind, "value": act.value},
+                        "argv_opts": argv_opts,
+                        "cmd": run_res.cmd_str,
+                        "run": {
+                            "duration_sec": run_res.duration_sec,
+                            "timed_out": run_res.timed_out,
+                            "returncode": run_res.returncode,
+                            "output_dir": None,
+                        },
+                        "obs": {
+                            "injectable": obs.injectable,
+                            "blocked": obs.blocked,
+                            "timeout": obs.timeout,
+                            "vulnerable_param": obs.vulnerable_param,
+                            "payload": obs.exploited_payload,
+                            "technique": obs.technique,
+                            "dbms": obs.dbms,
+                        },
+                        "reward": {
+                            "extrinsic": reward,
+                            "total": total_reward,
+                        },
+                        "config": asdict(cfg),
+                    }
+                    debug_f.write(json.dumps(dbg, ensure_ascii=False) + "\n")
+
+                last_obs = obs
+                last_obs_for_ip = obs
+
+                if obs.injectable:
+                    finding = {
+                        "url": str(ip["url"]),
+                        "method": str(ip["method"]),
+                        "vulnerable_param": obs.vulnerable_param,
+                        "sqlmap_payload": obs.exploited_payload,
+                        "technique": obs.technique,
+                        "dbms": obs.dbms,
+                        "blocked": obs.blocked,
+                        "timeout": obs.timeout,
+                        "episode_id": episode_id,
+                        "episode_index": ep,
+                        "steps_used": step + 1,
+                        "total_duration_sec": total_duration,
+                        "rl_sqlmap_cmd": run_res.cmd_str,
+                        "raw_snippet": obs.raw_snippet,
+                        "final_config": asdict(cfg),
+                    }
+                    results.append(finding)
+
+                    # Append a compact success record (JSONL) at repo root
+                    try:
+                        rec = {
+                            "ts": time.time(),
+                            "url": finding["url"],
+                            "method": finding.get("method"),
+                            "param": finding.get("vulnerable_param"),
+                            "payload": finding.get("sqlmap_payload"),
+                            "cmd_sqlmap": finding.get("rl_sqlmap_cmd"),
+                            "episode_id": finding.get("episode_id"),
+                            "episode_index": finding.get("episode_index"),
+                            "steps_used": finding.get("steps_used"),
+                            "total_duration_sec": finding.get("total_duration_sec"),
+                            "technique": finding.get("technique"),
+                            "dbms": finding.get("dbms"),
+                        }
+                        with open("success.jsonl", "a", encoding="utf-8") as sf:
+                            sf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    except Exception:
+                        pass
+
+                    ip_found = True
+                    break
+
+            if ip_found:
                 break
 
-            if detector.verdict().vulnerable:
-                _debug_print(debug, step, debug_steps, "[DBG] vulnerable -> stop.")
-                break
+        if not ip_found:
+            # max episodes reached without injectable
+            results.append(
+                {
+                    "url": str(ip["url"]),
+                    "method": str(ip["method"]),
+                    "vulnerable_param": None,
+                    "sqlmap_payload": None,
+                    "technique": last_obs_for_ip.technique if last_obs_for_ip else None,
+                    "dbms": last_obs_for_ip.dbms if last_obs_for_ip else None,
+                    "blocked": last_obs_for_ip.blocked if last_obs_for_ip else False,
+                    "timeout": last_obs_for_ip.timeout if last_obs_for_ip else False,
+                    "episode_id": None,
+                    "episodes_used": int(episodes_per_input),
+                    "steps_used": max_steps,
+                    "total_duration_sec": None,
+                    "rl_sqlmap_cmd": None,
+                    "raw_snippet": last_obs_for_ip.raw_snippet if last_obs_for_ip else "",
+                    "final_config": None,
+                }
+            )
 
-        det = detector.verdict()
-        results.append(
-            {
-                "injection_point": ip,
-                "vulnerable": bool(det.vulnerable),
-                "payload": det.trigger_payloads[0] if det.trigger_payloads else None,
-                "detection": _detection_method(det.evidence_summary),
-                "requests_used": int(requests_used),
-                "trigger_payloads": det.trigger_payloads,
-                "evidence_summary": det.evidence_summary,
-            }
-        )
-
-    payload_logger.flush()
     if model_out:
         agent.save(model_out)
+
+    if debug_f is not None:
+        debug_f.flush()
+        debug_f.close()
+
+    if json_output:
+        print(json.dumps({"target": target_url, "results": results}, indent=2, ensure_ascii=False))
 
     return results
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="scanner-sqli v2 (context-aware)")
+    ap = argparse.ArgumentParser(description="scanner-sqli (sqlmap-driven RL)")
     ap.add_argument("-u", "--url", required=True, help="Target URL")
-    ap.add_argument("--payload-csv", default="data/payloads.csv", help="CSV with seed payloads (query,label)")
-    ap.add_argument("--max-steps", type=int, default=50, help="Max mutation steps per injection point")
-    ap.add_argument("--timeout", type=int, default=15)
-    ap.add_argument("--retries", type=int, default=1)
+    ap.add_argument("--max-steps", type=int, default=15, help="Max steps (atomic options) per episode")
+    ap.add_argument("--episodes-per-input", type=int, default=1, help="Training episodes to run per injection point")
+    ap.add_argument("--timeout-sec", type=int, default=120, help="Timeout per sqlmap run")
     ap.add_argument("--epsilon", type=float, default=0.3)
-    ap.add_argument("--url-encode-payload", action="store_true")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--json", action="store_true")
-    ap.add_argument("--model-in", default=None, help="Load context-aware agent model")
-    ap.add_argument("--model-out", default=None, help="Save context-aware agent model")
-    ap.add_argument("--debug", action="store_true", help="Print debug info for fuzzing loop")
-    ap.add_argument("--debug-steps", type=int, default=10, help="Max debug steps printed per injection point (-1 = all)")
+    ap.add_argument("--model-in", default=None)
+    ap.add_argument("--model-out", default=None)
+    ap.add_argument(
+        "--debug-log",
+        default=None,
+        help='Write per-step debug events as JSONL into ./debug (use "1" to auto-name)',
+    )
 
     args = ap.parse_args()
 
-    results = scan(
+    scan(
         target_url=args.url,
-        payload_csv=args.payload_csv,
         max_steps=args.max_steps,
-        timeout=args.timeout,
-        retries=args.retries,
+        episodes_per_input=args.episodes_per_input,
+        timeout_sec=args.timeout_sec,
         epsilon=args.epsilon,
-        url_encode_payload=args.url_encode_payload,
         seed=args.seed,
         model_in=args.model_in,
         model_out=args.model_out,
-        debug=args.debug,
-        debug_steps=args.debug_steps,
+        json_output=args.json,
+        debug_log=args.debug_log,
     )
-
-    if args.json:
-        print(json.dumps({"target": args.url, "results": results}, indent=2, ensure_ascii=False))
-        return
-
-    vulns = [r for r in results if r.get("vulnerable")]
-    if not vulns:
-        print("[-] No SQLi findings detected.")
-        return
-
-    for f in vulns:
-        _print_finding(f)
 
 
 if __name__ == "__main__":

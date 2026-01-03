@@ -2,15 +2,15 @@
 
 A minimal epsilon-greedy policy over a discrete action space.
 
-Actions are tuples: (payload_id, mutation_id)
+Actions are discrete ids (ints) from a fixed action space.
 """
 
 from __future__ import annotations
 
 import random
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-Action = Tuple[int, str]
+Action = int
 
 
 class EpsilonGreedyPolicy:

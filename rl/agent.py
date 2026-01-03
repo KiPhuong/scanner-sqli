@@ -1,21 +1,20 @@
-"""rl.agent (context-aware)
+"""rl.agent (sqlmap-driven RL)
 
-This agent operates on a tokenized payload representation.
+Discrete-action RL agent for sequential sqlmap option selection.
 
-Action Space (dynamic)
-- The agent selects from a list of valid (token_idx, mutation_id) pairs provided
-  by the orchestrator for the current payload state.
+Action Space
+- Fixed discrete action ids: 0..N-1
+- Each action corresponds to an atomic OptionAction (e.g. set technique, add tamper)
 
 State Representation
-- The state represents the local context of a specific token within the payload,
-  plus global response metrics.
+- A fixed-length float vector produced by the orchestrator (scanner.py)
 
 Q-Function
-- Linear Q per mutation type: Q(s, m) = w_m · s
+- Linear Q per action: Q(s, a) = w_a · s
 
 Stability / exploration
-- We break tie-bias by initializing weights with small random values.
-- Epsilon-greedy is used for exploration.
+- Epsilon-greedy policy
+- Optional RND intrinsic reward to encourage exploration
 """
 
 from __future__ import annotations
@@ -24,15 +23,11 @@ import json
 import os
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from payload.tokenizer import Token, TokenType
 from rl.policy import EpsilonGreedyPolicy
 from rl.replay_buffer import ReplayBuffer, Transition
 from rl.rnd import RND
-
-
-Action = Tuple[int, str]  # (token_idx, mutation_id)
 
 
 def _dot(a: List[float], b: List[float]) -> float:
@@ -57,12 +52,12 @@ class AgentConfig:
 
 
 class Agent:
-    def __init__(self, mutation_ids: List[str], config: AgentConfig):
-        if not mutation_ids:
-            raise ValueError("mutation_ids is empty")
+    def __init__(self, action_ids: List[int], config: AgentConfig):
+        if not action_ids:
+            raise ValueError("action_ids is empty")
 
-        self.mutation_ids = sorted(mutation_ids)
-        self.mutation_index: Dict[str, int] = {mid: i for i, mid in enumerate(self.mutation_ids)}
+        self.action_ids = sorted(action_ids)
+        self.action_index: Dict[int, int] = {aid: i for i, aid in enumerate(self.action_ids)}
 
         self.cfg = config
         self._rng = random.Random(config.seed)
@@ -70,9 +65,9 @@ class Agent:
         self.policy = EpsilonGreedyPolicy(epsilon=config.epsilon, seed=config.seed)
         self.replay = ReplayBuffer(capacity=config.replay_capacity, seed=config.seed)
 
-        # One weight vector per MUTATION type. Small random init reduces greedy tie-bias.
+        # One weight vector per ACTION id. Small random init reduces greedy tie-bias.
         self.weights: List[List[float]] = [
-            _rand_small(self._rng, self.cfg.state_dim) for _ in range(len(self.mutation_ids))
+            _rand_small(self._rng, self.cfg.state_dim) for _ in range(len(self.action_ids))
         ]
 
         self.rnd: Optional[RND] = None
@@ -86,87 +81,48 @@ class Agent:
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         payload = {
-            "version": 2,
+            "version": 3,
             "state_dim": self.cfg.state_dim,
-            "mutation_ids": self.mutation_ids,
+            "action_ids": self.action_ids,
             "weights": self.weights,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
 
     @classmethod
-    def load_from_file(cls, path: str, mutation_ids: List[str], config: AgentConfig) -> "Agent":
-        agent = cls(mutation_ids=mutation_ids, config=config)
+    def load_from_file(cls, path: str, action_ids: List[int], config: AgentConfig) -> "Agent":
+        agent = cls(action_ids=action_ids, config=config)
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        if int(data.get("version", 0)) != 2:
+        if int(data.get("version", 0)) != 3:
             raise ValueError(f"Incompatible model version: {data.get('version')}")
 
         if int(data["state_dim"]) != config.state_dim:
             raise ValueError("state_dim mismatch")
 
-        saved_muts = data["mutation_ids"]
-        if sorted(saved_muts) != sorted(mutation_ids):
-            raise ValueError("mutation_ids mismatch")
+        saved_ids = data["action_ids"]
+        if sorted(saved_ids) != sorted(action_ids):
+            raise ValueError("action_ids mismatch")
 
         agent.weights = data["weights"]
         return agent
 
     # -------------------------
-    # State construction
-    # -------------------------
-
-    @staticmethod
-    def build_state(
-        tokens: List[Token],
-        token_idx: int,
-        time_delta: float,
-        length_delta: float,
-        semantic_similarity: float,
-        status_code: int,
-    ) -> List[float]:
-        tok = tokens[token_idx]
-        prev_tok = tokens[token_idx - 1] if token_idx > 0 else None
-        next_tok = tokens[token_idx + 1] if token_idx + 1 < len(tokens) else None
-
-        enum_vals = list(TokenType)
-        dim = len(enum_vals)
-
-        def one_hot(t: Optional[Token]) -> List[float]:
-            v = [0.0] * dim
-            if t is None:
-                return v
-            v[enum_vals.index(t.type)] = 1.0
-            return v
-
-        tok_type_emb = one_hot(tok)
-        prev_type_emb = one_hot(prev_tok)
-        next_type_emb = one_hot(next_tok)
-
-        td = max(-30.0, min(30.0, float(time_delta)))
-        ld = max(-1e6, min(1e6, float(length_delta)))
-        ss = max(0.0, min(1.0, float(semantic_similarity)))
-        sc = float(status_code) / 1000.0
-
-        return tok_type_emb + prev_type_emb + next_type_emb + [td, ld, ss, sc]
-
-    # -------------------------
     # Action selection
     # -------------------------
 
-    def select_action(self, valid_actions: List[Action], state_builder) -> Action:
-        if not valid_actions:
-            raise ValueError("valid_actions is empty")
+    def select_action(self, valid_action_ids: List[int], state: List[float]) -> int:
+        if not valid_action_ids:
+            raise ValueError("valid_action_ids is empty")
 
         q_values: List[float] = []
-        for token_idx, mutation_id in valid_actions:
-            s = state_builder(token_idx)
-            m_idx = self.mutation_index[mutation_id]
-            q_values.append(_dot(self.weights[m_idx], s))
+        for aid in valid_action_ids:
+            a_idx = self.action_index[aid]
+            q_values.append(_dot(self.weights[a_idx], state))
 
         chosen_idx = self.policy.select(q_values)
-        return valid_actions[chosen_idx]
+        return valid_action_ids[chosen_idx]
 
     # -------------------------
     # Learning / Replay
@@ -174,36 +130,26 @@ class Agent:
 
     def observe(
         self,
+        *,
         state: List[float],
-        action: Action,
-        extrinsic_reward: float,
-        next_valid_actions: List[Action],
-        next_state_builder,
+        action: int,
+        reward: float,
+        next_state: List[float],
         done: bool,
     ) -> float:
         intrinsic = 0.0
         if self.rnd is not None:
             intrinsic = self.rnd.update(state)
 
-        total_reward = float(extrinsic_reward + self.cfg.intrinsic_scale * intrinsic)
+        total_reward = float(reward + self.cfg.intrinsic_scale * intrinsic)
 
-        if done or not next_valid_actions:
-            max_next_q = 0.0
-        else:
-            next_qs = []
-            for next_token_idx, mutation_id in next_valid_actions:
-                s2 = next_state_builder(next_token_idx)
-                m_idx = self.mutation_index[mutation_id]
-                next_qs.append(_dot(self.weights[m_idx], s2))
-            max_next_q = max(next_qs) if next_qs else 0.0
-
-        # store max_next_q in next_state to keep Transition type unchanged
+        # For this linear-Q agent we store the whole next_state and compute maxQ during learn.
         self.replay.push(
             Transition(
                 state=list(state),
-                action=action,
+                action=int(action),
                 reward=total_reward,
-                next_state=[float(max_next_q)],
+                next_state=list(next_state),
                 done=bool(done),
             )
         )
@@ -217,17 +163,23 @@ class Agent:
 
         batch = self.replay.sample(self.cfg.batch_size)
         for tr in batch:
-            _token_idx, mutation_id = tr.action
-            m_idx = self.mutation_index.get(mutation_id)
-            if m_idx is None:
+            a_idx = self.action_index.get(tr.action)
+            if a_idx is None:
                 continue
 
-            q_sa = _dot(self.weights[m_idx], tr.state)
-            max_next_q = float(tr.next_state[0]) if tr.next_state else 0.0
+            q_sa = _dot(self.weights[a_idx], tr.state)
+
+            if tr.done:
+                max_next_q = 0.0
+            else:
+                # Over fixed action space
+                next_qs = [_dot(self.weights[i], tr.next_state) for i in range(len(self.action_ids))]
+                max_next_q = max(next_qs) if next_qs else 0.0
+
             target = tr.reward + self.cfg.gamma * max_next_q
             td_err = target - q_sa
 
-            w = self.weights[m_idx]
+            w = self.weights[a_idx]
             lr = self.cfg.lr
             for i in range(self.cfg.state_dim):
                 w[i] += lr * td_err * tr.state[i]

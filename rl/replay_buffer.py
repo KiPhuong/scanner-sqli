@@ -7,7 +7,7 @@ Stores transitions:
 
 Where:
 - s and s' are flat float vectors
-- a is a tuple (payload_id, mutation_id)
+- a is a discrete action id (int)
 
 This buffer is framework-agnostic; the Agent can implement learning however it
 wants.
@@ -16,11 +16,11 @@ wants.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 import random
 
 
-Action = Tuple[int, str]
+Action = int  # discrete action id
 
 
 @dataclass(frozen=True)
