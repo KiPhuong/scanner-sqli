@@ -1,48 +1,40 @@
 """core.crawler
 
-A small, reliable HTML crawler focused on collecting injection points for
-pentesting.
+A small HTML crawler focused on collecting injection targets.
 
-Features
+Current behavior:
 - Fetches a target URL (single page; no link-following by default).
-- Extracts:
-  - GET parameters from the URL query string
-  - HTML forms (method, action, input names + default values)
-- Produces a list of injection points, each containing:
-  - url
-  - method
-  - param
-  - value
+- Extracts GET parameters from the URL query string.
+- Extracts HTML forms (method, action, input names + default values).
 
-Non-goals
-- No JavaScript/AJAX execution.
-- No complex crawling logic (depth/queue) unless you add it.
+Important for sqlmap integration:
+- We need the *full default parameter set* for each form/URL, so that we can
+  test one parameter at a time while keeping others fixed.
 
-This module is intentionally dependency-light and prioritizes robustness.
+Therefore we expose a higher-level "RequestTemplate" structure.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
-from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
+from typing import Dict, Iterable, List, Optional
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
 
 
 @dataclass(frozen=True)
-class InjectionPoint:
-    """A single parameter location that can be fuzzed/injected."""
+class RequestTemplate:
+    """A concrete request template extracted from a URL or HTML form."""
 
     url: str
-    method: str
-    param: str
-    value: str
+    method: str  # GET/POST
+    params: Dict[str, str]  # default values (query params for GET, body for POST)
 
 
 class Crawler:
-    """Simple crawler/parser that turns a page into injection points."""
+    """Simple crawler/parser that turns a page into request templates."""
 
     def __init__(
         self,
@@ -60,24 +52,29 @@ class Crawler:
 
         self.session = session or requests.Session()
         self.session.headers.setdefault("User-Agent", user_agent)
-        self.session.headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        self.session.headers.setdefault(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
 
-    def crawl(self, target_url: str) -> List[InjectionPoint]:
-        """Fetch target_url and return discovered injection points."""
+    def crawl(self, target_url: str) -> List[RequestTemplate]:
+        """Fetch target_url and return discovered request templates."""
 
         resp = self._fetch(target_url)
         content_type = (resp.headers.get("Content-Type") or "").lower()
 
-        points: List[InjectionPoint] = []
+        templates: List[RequestTemplate] = []
 
-        # 1) GET params from the URL itself
-        points.extend(self._extract_get_params(str(resp.url)))
+        # 1) GET template from the URL itself (if it has query params)
+        get_tpl = self._extract_get_template(str(resp.url))
+        if get_tpl is not None:
+            templates.append(get_tpl)
 
-        # 2) HTML forms, only if the response looks like HTML
+        # 2) HTML forms
         if "html" in content_type or resp.text.lstrip().startswith("<"):
-            points.extend(self._extract_forms(str(resp.url), resp.text))
+            templates.extend(self._extract_forms(str(resp.url), resp.text))
 
-        return self._dedupe(points)
+        return self._dedupe(templates)
 
     # -------------------------
     # Networking
@@ -93,7 +90,6 @@ class Crawler:
         )
         r.raise_for_status()
 
-        # Protect from huge bodies; read up to max_response_size
         content = b""
         for chunk in r.iter_content(chunk_size=64 * 1024):
             if not chunk:
@@ -102,8 +98,6 @@ class Crawler:
             if len(content) > self.max_response_size:
                 break
 
-        # Rebuild a normal Response-like object with limited body
-        # requests.Response keeps the content in a private attribute
         r._content = content
         r.encoding = r.encoding or "utf-8"
         return r
@@ -112,55 +106,40 @@ class Crawler:
     # Extraction
     # -------------------------
 
-    def _extract_get_params(self, url: str) -> List[InjectionPoint]:
+    def _extract_get_template(self, url: str) -> Optional[RequestTemplate]:
         parts = urlsplit(url)
-        base_url = urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, parts.fragment))
+        params = {k: v for k, v in parse_qsl(parts.query, keep_blank_values=True)}
+        if not params:
+            return None
 
-        points: List[InjectionPoint] = []
-        for k, v in parse_qsl(parts.query, keep_blank_values=True):
-            points.append(
-                InjectionPoint(
-                    url=base_url,
-                    method="GET",
-                    param=k,
-                    value=v,
-                )
-            )
-        return points
+        base_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
+        return RequestTemplate(url=base_url, method="GET", params=params)
 
-    def _extract_forms(self, base_url: str, html: str) -> List[InjectionPoint]:
+    def _extract_forms(self, base_url: str, html: str) -> List[RequestTemplate]:
         soup = BeautifulSoup(html, "html.parser")
-        points: List[InjectionPoint] = []
+        templates: List[RequestTemplate] = []
 
         for form in soup.find_all("form"):
             method = (form.get("method") or "GET").strip().upper()
             action = (form.get("action") or "").strip()
             action_url = urljoin(base_url, action) if action else base_url
 
-            # Collect parameters from inputs/selects/textareas
+            params: Dict[str, str] = {}
             for name, value in self._iter_form_fields(form):
-                points.append(
-                    InjectionPoint(
-                        url=action_url,
-                        method=method,
-                        param=name,
-                        value=value,
-                    )
-                )
+                # keep the last value if duplicates (common in forms)
+                params[name] = value
 
-        return points
+            # Even if params is empty, a form can still be submit-only; skip empty
+            if not params:
+                continue
+
+            templates.append(RequestTemplate(url=action_url, method=method, params=params))
+
+        return templates
 
     def _iter_form_fields(self, form_tag) -> Iterable[tuple[str, str]]:
-        """Yield (name, value) for fuzzable fields in a form.
+        """Yield (name, value) for fuzzable fields in a form."""
 
-        Notes:
-        - Ignores fields without a name.
-        - Ignores submit/button/image by default.
-        - For checkboxes/radios, only includes if checked; falls back to "on".
-        - For select, picks selected option, else first.
-        """
-
-        # input
         for inp in form_tag.find_all("input"):
             name = (inp.get("name") or "").strip()
             if not name:
@@ -177,14 +156,12 @@ class Crawler:
 
             yield name, str(inp.get("value") or "")
 
-        # textarea
         for ta in form_tag.find_all("textarea"):
             name = (ta.get("name") or "").strip()
             if not name:
                 continue
             yield name, (ta.text or "")
 
-        # select
         for sel in form_tag.find_all("select"):
             name = (sel.get("name") or "").strip()
             if not name:
@@ -206,20 +183,19 @@ class Crawler:
     # Utilities
     # -------------------------
 
-    def _dedupe(self, points: List[InjectionPoint]) -> List[InjectionPoint]:
+    def _dedupe(self, templates: List[RequestTemplate]) -> List[RequestTemplate]:
         seen = set()
-        out: List[InjectionPoint] = []
-        for p in points:
-            key = (p.url, p.method.upper(), p.param, p.value)
+        out: List[RequestTemplate] = []
+        for t in templates:
+            # Normalize params ordering for dedupe
+            key = (t.url, t.method.upper(), tuple(sorted(t.params.items())))
             if key in seen:
                 continue
             seen.add(key)
-            out.append(p)
+            out.append(t)
         return out
 
 
-def crawl(target_url: str, **kwargs) -> List[InjectionPoint]:
-    """Convenience functional API."""
-
-    return Crawler(**kwargs).crawl(target_url)
-
+def encode_get_url(base_url: str, params: Dict[str, str]) -> str:
+    """Build a GET URL with query parameters."""
+    return base_url + ("?" + urlencode(params, doseq=True) if params else "")

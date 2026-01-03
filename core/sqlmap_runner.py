@@ -4,10 +4,11 @@ Runs the bundled sqlmap (./sqlmap/sqlmap.py) as a subprocess.
 
 One RL step = one sqlmap execution.
 
-By default we do NOT use sqlmap's --output-dir to avoid writing lots of files.
-We only capture stdout/stderr for parsing and reporting.
-
-If you later need artifacts, you can re-add output_dir plumbing.
+Notes:
+- We DO NOT use sqlmap's --output-dir (to avoid writing lots of files)
+- We DO NOT pass --method, because some sqlmap versions (e.g. 1.4.4 stable)
+  don't accept it. For POST requests we pass --data, for GET we embed params
+  into the URL.
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ from typing import List, Optional, Sequence
 @dataclass(frozen=True)
 class SqlmapTarget:
     url: str
-    method: str = "GET"  # GET/POST
 
 
 @dataclass(frozen=True)
@@ -53,18 +53,12 @@ class SqlmapRunner:
     def __init__(self, run_cfg: SqlmapRunConfig):
         self.cfg = run_cfg
 
-    def build_cmd(
-        self,
-        target: SqlmapTarget,
-        argv_options: Sequence[str],
-    ) -> List[str]:
+    def build_cmd(self, target: SqlmapTarget, argv_options: Sequence[str]) -> List[str]:
         cmd: List[str] = [
             self.cfg.python_exe,
             self.cfg.sqlmap_script,
             "-u",
             target.url,
-            "--method",
-            target.method,
             "--threads",
             str(self.cfg.threads),
             "-v",
@@ -81,12 +75,7 @@ class SqlmapRunner:
         cmd.extend(list(argv_options))
         return cmd
 
-    def run(
-        self,
-        *,
-        target: SqlmapTarget,
-        argv_options: Sequence[str],
-    ) -> SqlmapRunResult:
+    def run(self, *, target: SqlmapTarget, argv_options: Sequence[str]) -> SqlmapRunResult:
         cmd = self.build_cmd(target=target, argv_options=argv_options)
 
         t0 = time.perf_counter()
@@ -124,7 +113,6 @@ class SqlmapRunner:
 
 
 def _shell_quote(s: str) -> str:
-    # Simple quote for report readability (not a security boundary)
     if not s:
         return "''"
     if any(c.isspace() for c in s) or '"' in s or "'" in s:

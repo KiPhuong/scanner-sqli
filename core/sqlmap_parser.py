@@ -8,8 +8,7 @@ Goal:
 - Extract an exploited payload string (best-effort)
 - Detect block/WAF-ish responses and timeouts
 
-NOTE: sqlmap output varies by version/config. This parser intentionally uses
-heuristics and regex; it should be improved with real samples from your runs.
+Blocked detection is intentionally conservative to avoid false positives.
 """
 
 from __future__ import annotations
@@ -37,17 +36,16 @@ _RE_TECHNIQUE = re.compile(r"(?i)Type:\s*(boolean-based blind|error-based|time-b
 _RE_DBMS = re.compile(r"(?i)back-end DBMS:\s*([^\n\r]+)")
 _RE_PAYLOAD_LINE = re.compile(r"(?i)Payload:\s*(.+)")
 
-_BLOCK_MARKERS = [
-    "WAF",
-    "web application firewall",
-    "blocked",
-    "forbidden",
-    "not acceptable",
-    "access denied",
-    "request blocked",
-    "security policy",
-    "captcha",
-]
+# Strong WAF/IPS indicators.
+# IMPORTANT: Do not treat sqlmap's generic sentence "checking if the target is protected by some kind of WAF/IPS" as blocked.
+_RE_WAF_STRONG = re.compile(
+    r"(?is)(?:\bWAF\b\s*/\s*IPS\s+protection\s+identified|\bWAF\b\s+identified|"
+    r"web\s+application\s+firewall\s+identified|"
+    r"identified\s+waf|identified\s+as\s+waf|"
+    r"mod_security|modsecurity|cloudflare|akamai|imperva|f5\s+big\s*ip|"
+    r"access\s+denied|request\s+denied|captcha)")
+
+_RE_HTTP_BLOCK = re.compile(r"(?i)\b(403|406|429)\b")
 
 
 def parse_sqlmap_output(stdout: str, stderr: str, *, timed_out: bool) -> SqlmapObservation:
@@ -69,7 +67,7 @@ def parse_sqlmap_output(stdout: str, stderr: str, *, timed_out: bool) -> SqlmapO
     if m_pay:
         payload = m_pay.group(1).strip()
 
-    blocked = _is_blocked(text)
+    blocked = bool(_RE_HTTP_BLOCK.search(text) or _RE_WAF_STRONG.search(text))
 
     timeout = bool(timed_out or re.search(r"(?i)tim(e|ed) out|connection timed out|read timed out", text))
 
@@ -87,20 +85,13 @@ def parse_sqlmap_output(stdout: str, stderr: str, *, timed_out: bool) -> SqlmapO
     )
 
 
-def _is_blocked(text: str) -> bool:
-    t = text.lower()
-    for m in _BLOCK_MARKERS:
-        if m.lower() in t:
-            return True
-    if re.search(r"(?i)\b(403|406|429)\b", text):
-        return True
-    return False
-
-
 def _extract_relevant_snippet(text: str, max_len: int = 2000) -> str:
     lines = []
     for line in text.splitlines():
-        if re.search(r"(?i)parameter:|payload:|back-end dbms:|type:|vulnerable|injectable|waf|forbidden|captcha", line):
+        if re.search(
+            r"(?i)parameter:|payload:|back-end dbms:|type:|vulnerable|injectable|identified\s+waf|waf\b\s+identified|modsecurity|cloudflare|akamai|imperva|access denied|captcha|\b(403|406|429)\b",
+            line,
+        ):
             lines.append(line.strip())
     snippet = "\n".join(lines).strip()
     if not snippet:
