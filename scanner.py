@@ -8,22 +8,23 @@ Episode ends when:
 - max_steps reached (default 15)
 
 Crawler integration:
-- We extract RequestTemplate(s): (url, method, default params)
-- Then we test ONE parameter at a time (-p <param>) while keeping other
+- Extract RequestTemplate(s): (url, method, default params)
+- Test ONE parameter at a time (-p <param>) while keeping other
   parameters fixed at their default values.
 
-Important practical note:
-- If the currently tested parameter has an empty default value, sqlmap will
-  warn and can behave poorly. We therefore provide a baseline non-empty value
-  for the injected parameter using a simple heuristic:
+Non-empty baseline for injected parameter:
+- If the currently tested parameter has an empty default value, provide
+  baseline using heuristic:
     - numeric-ish param names -> "1"
     - else -> "a"
 
-Output/report includes:
-- url
-- vulnerable parameter
-- exploited payload (best-effort parsed from sqlmap output)
-- RL-generated payload: the sqlmap command that led to the result
+Accurate request counting:
+- Optional traffic logging via sqlmap -t TRAFFICFILE
+- We parse traffic logs to count HTTP requests per sqlmap run.
+
+Outputs:
+- success.jsonl (append per successful injectable)
+- summary.jsonl (per input summary: total requests, requests-to-first-vuln, payload, cmd)
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import asdict
@@ -60,7 +62,6 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _default_injected_value(param_name: str) -> str:
-    """Heuristic baseline value for the injected parameter when default is empty."""
     p = (param_name or "").lower()
     numeric_hints = [
         "id",
@@ -79,6 +80,33 @@ def _default_injected_value(param_name: str) -> str:
     if any(h in p for h in numeric_hints) or p.endswith("id"):
         return "1"
     return "a"
+
+
+def _load_blocked_keywords(path: Optional[str]) -> List[str]:
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            out = []
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith("#"):
+                    continue
+                out.append(s)
+            return out
+    except Exception:
+        return []
+
+
+def _build_test_skip_regex(keywords: List[str]) -> Optional[str]:
+    if not keywords:
+        return None
+    escaped = [re.escape(k) for k in keywords if k]
+    if not escaped:
+        return None
+    return r"(?i)(" + "|".join(escaped) + r")"
 
 
 def build_state(
@@ -170,6 +198,9 @@ def scan(
     model_out: Optional[str] = None,
     json_output: bool = False,
     debug_log: Optional[str] = None,
+    blocked_keywords_file: Optional[str] = None,
+    traffic_log_dir: Optional[str] = None,
+    summary_out: str = "summary.jsonl",
 ) -> List[dict]:
     session = requests.Session()
     session.headers.setdefault("User-Agent", "scanner-sqli-sqlmap-rl/1.0")
@@ -216,6 +247,13 @@ def scan(
     if model_in and os.path.exists(model_in):
         agent = Agent.load_from_file(model_in, action_ids=action_ids, config=agent_cfg)
 
+    blocked_keywords = _load_blocked_keywords(blocked_keywords_file)
+    test_skip_regex = _build_test_skip_regex(blocked_keywords)
+
+    extra_args = ["--smart", "--skip-static"]
+    if test_skip_regex:
+        extra_args.extend(["--test-skip", test_skip_regex])
+
     runner = SqlmapRunner(
         SqlmapRunConfig(
             timeout_sec=timeout_sec,
@@ -223,7 +261,7 @@ def scan(
             batch=True,
             flush_session=True,
             verbosity=1,
-            extra_args=["--smart", "--skip-static"],
+            extra_args=extra_args,
         )
     )
 
@@ -243,10 +281,30 @@ def scan(
             path = os.path.join("debug", path)
         debug_f = open(path, "a", encoding="utf-8")
 
+    if traffic_log_dir:
+        os.makedirs(traffic_log_dir, exist_ok=True)
+
+    # summary records are written once per input at end
+    summary_records: List[dict] = []
+
     for tpl in templates:
         base_params = dict(tpl.params)
         for inject_param in list(base_params.keys()):
-            ip_found = False
+            input_key = {
+                "url": tpl.url,
+                "method": tpl.method.upper(),
+                "param": inject_param,
+                "defaults": base_params,
+            }
+
+            total_http_requests = 0
+            found = False
+            http_requests_to_first_vuln: Optional[int] = None
+            finding_payload: Optional[str] = None
+            finding_cmd: Optional[str] = None
+            finding_episode: Optional[int] = None
+            finding_step: Optional[int] = None
+
             last_obs_for_ip: Optional[SqlmapObservation] = None
 
             for ep in range(max(1, int(episodes_per_input))):
@@ -254,7 +312,6 @@ def scan(
                 cfg = SqlmapConfig()
                 last_obs: Optional[SqlmapObservation] = None
                 last_duration = 0.0
-                total_duration = 0.0
                 tried_techniques: Set[str] = set()
 
                 for step in range(max_steps):
@@ -294,10 +351,19 @@ def scan(
 
                     argv_opts = list(argv_opts) + ["-p", inject_param]
 
-                    run_res = runner.run(target=target, argv_options=argv_opts)
+                    traffic_path = None
+                    if traffic_log_dir:
+                        safe_param = re.sub(r"[^a-zA-Z0-9_\-]", "_", inject_param)
+                        traffic_path = os.path.join(
+                            traffic_log_dir,
+                            f"{int(time.time())}_{safe_param}_{ep}_{step}.txt",
+                        )
+
+                    run_res = runner.run(target=target, argv_options=argv_opts, traffic_log_path=traffic_path)
+
+                    total_http_requests += int(run_res.requests_count)
 
                     last_duration = float(run_res.duration_sec)
-                    total_duration += float(run_res.duration_sec)
 
                     obs = parse_sqlmap_output(run_res.stdout, run_res.stderr, timed_out=run_res.timed_out)
                     reward = compute_reward(obs, duration_sec=run_res.duration_sec, cfg=reward_cfg)
@@ -340,6 +406,8 @@ def scan(
                                 "duration_sec": run_res.duration_sec,
                                 "timed_out": run_res.timed_out,
                                 "returncode": run_res.returncode,
+                                "requests_count": run_res.requests_count,
+                                "traffic_log": traffic_path,
                             },
                             "obs": {
                                 "injectable": obs.injectable,
@@ -356,17 +424,19 @@ def scan(
                             "defaults": {"method": tpl.method, "url": tpl.url, "params": base_params},
                             "effective_params": params,
                         }
-                        # if blocked, include a small stdout head for diagnosis
-                        if obs.blocked:
-                            dbg["stdout_head"] = (run_res.stdout or "")[:1000]
-                            dbg["stderr_head"] = (run_res.stderr or "")[:1000]
-
                         debug_f.write(json.dumps(dbg, ensure_ascii=False) + "\n")
 
                     last_obs = obs
                     last_obs_for_ip = obs
 
                     if obs.injectable:
+                        found = True
+                        http_requests_to_first_vuln = int(total_http_requests)
+                        finding_payload = obs.exploited_payload
+                        finding_cmd = run_res.cmd_str
+                        finding_episode = ep
+                        finding_step = step
+
                         finding = {
                             "url": target.url,
                             "method": tpl.method.upper(),
@@ -379,10 +449,12 @@ def scan(
                             "episode_id": episode_id,
                             "episode_index": ep,
                             "steps_used": step + 1,
-                            "total_duration_sec": total_duration,
+                            "total_duration_sec": None,
                             "rl_sqlmap_cmd": run_res.cmd_str,
                             "raw_snippet": obs.raw_snippet,
                             "final_config": asdict(cfg),
+                            "http_requests_to_first_vuln": http_requests_to_first_vuln,
+                            "http_requests_total": total_http_requests,
                         }
                         results.append(finding)
 
@@ -397,41 +469,51 @@ def scan(
                                 "episode_id": finding.get("episode_id"),
                                 "episode_index": finding.get("episode_index"),
                                 "steps_used": finding.get("steps_used"),
-                                "total_duration_sec": finding.get("total_duration_sec"),
-                                "technique": finding.get("technique"),
-                                "dbms": finding.get("dbms"),
+                                "http_requests_to_first_vuln": finding.get("http_requests_to_first_vuln"),
+                                "http_requests_total": finding.get("http_requests_total"),
                             }
                             with open("success.jsonl", "a", encoding="utf-8") as sf:
                                 sf.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         except Exception:
                             pass
 
-                        ip_found = True
                         break
 
-                if ip_found:
+                if found:
                     break
 
-            if not ip_found:
-                results.append(
-                    {
-                        "url": encode_get_url(tpl.url, base_params) if tpl.method.upper() == "GET" else tpl.url,
-                        "method": tpl.method.upper(),
-                        "vulnerable_param": inject_param,
-                        "sqlmap_payload": None,
+            # Write per-input summary record
+            summary_records.append(
+                {
+                    "ts": time.time(),
+                    "target": target_url,
+                    "input": input_key,
+                    "total_http_requests": int(total_http_requests),
+                    "found": bool(found),
+                    "http_requests_to_first_vuln": http_requests_to_first_vuln,
+                    "finding": {
+                        "payload": finding_payload,
+                        "cmd_sqlmap": finding_cmd,
+                        "episode_index": finding_episode,
+                        "step_index": finding_step,
+                    }
+                    if found
+                    else None,
+                    "last_obs": {
+                        "raw_snippet": last_obs_for_ip.raw_snippet if last_obs_for_ip else "",
                         "technique": last_obs_for_ip.technique if last_obs_for_ip else None,
                         "dbms": last_obs_for_ip.dbms if last_obs_for_ip else None,
-                        "blocked": last_obs_for_ip.blocked if last_obs_for_ip else False,
-                        "timeout": last_obs_for_ip.timeout if last_obs_for_ip else False,
-                        "episode_id": None,
-                        "episodes_used": int(episodes_per_input),
-                        "steps_used": max_steps,
-                        "total_duration_sec": None,
-                        "rl_sqlmap_cmd": None,
-                        "raw_snippet": last_obs_for_ip.raw_snippet if last_obs_for_ip else "",
-                        "final_config": None,
-                    }
-                )
+                    },
+                }
+            )
+
+    # Write summary.jsonl
+    try:
+        with open(summary_out, "w", encoding="utf-8") as f:
+            for rec in summary_records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
     if model_out:
         agent.save(model_out)
@@ -468,6 +550,21 @@ def main() -> None:
         default=None,
         help='Write per-step debug events as JSONL into ./debug (use "1" to auto-name)',
     )
+    ap.add_argument(
+        "--blocked-keywords-file",
+        default=None,
+        help="Path to .txt file with blocked keywords (one per line). Used to build --test-skip regex.",
+    )
+    ap.add_argument(
+        "--traffic-log-dir",
+        default=None,
+        help="Directory to store sqlmap traffic logs (-t) per run. Enables accurate HTTP request counting.",
+    )
+    ap.add_argument(
+        "--summary-out",
+        default="summary.jsonl",
+        help="Output summary file path (JSONL).",
+    )
 
     args = ap.parse_args()
 
@@ -482,6 +579,9 @@ def main() -> None:
         model_out=args.model_out,
         json_output=args.json,
         debug_log=args.debug_log,
+        blocked_keywords_file=args.blocked_keywords_file,
+        traffic_log_dir=args.traffic_log_dir,
+        summary_out=args.summary_out,
     )
 
 

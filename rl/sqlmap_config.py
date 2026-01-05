@@ -21,10 +21,14 @@ class SqlmapConfig:
     delay: Optional[float] = None
     time_sec: Optional[int] = None
 
-    # New knobs
+    # Request behavior knobs
     random_agent: bool = False
     timeout: Optional[int] = None
     retries: Optional[int] = None
+
+    # Payload shaping knobs
+    prefix: Optional[str] = None
+    suffix: Optional[str] = None
 
     tampers: List[str] = field(default_factory=list)
 
@@ -37,6 +41,8 @@ class SqlmapConfig:
         self.random_agent = False
         self.timeout = None
         self.retries = None
+        self.prefix = None
+        self.suffix = None
         self.tampers = []
 
 
@@ -66,7 +72,7 @@ def apply_option(cfg: SqlmapConfig, act: OptionAction, *, max_tampers: int = 15)
         return
 
     if act.kind == "random_agent":
-        cfg.random_agent = (act.value == "on")
+        cfg.random_agent = act.value == "on"
         return
 
     if act.kind == "timeout":
@@ -75,6 +81,14 @@ def apply_option(cfg: SqlmapConfig, act: OptionAction, *, max_tampers: int = 15)
 
     if act.kind == "retries":
         cfg.retries = int(act.value) if act.value is not None else None
+        return
+
+    if act.kind == "prefix":
+        cfg.prefix = act.value
+        return
+
+    if act.kind == "suffix":
+        cfg.suffix = act.value
         return
 
     if act.kind == "add_tamper":
@@ -104,6 +118,12 @@ def to_sqlmap_args(cfg: SqlmapConfig) -> List[str]:
     if cfg.retries is not None:
         args.extend(["--retries", str(cfg.retries)])
 
+    if cfg.prefix is not None:
+        args.extend(["--prefix", cfg.prefix])
+
+    if cfg.suffix is not None:
+        args.extend(["--suffix", cfg.suffix])
+
     if cfg.technique:
         args.extend(["--technique", cfg.technique])
 
@@ -113,12 +133,10 @@ def to_sqlmap_args(cfg: SqlmapConfig) -> List[str]:
     if cfg.delay is not None:
         args.extend(["--delay", str(cfg.delay)])
 
-    # If technique includes time-based, ensure time-sec exists
     if cfg.time_sec is not None:
         args.extend(["--time-sec", str(cfg.time_sec)])
-    else:
-        if cfg.technique and "T" in cfg.technique:
-            args.extend(["--time-sec", "5"])  # safe default
+    elif cfg.technique and "T" in cfg.technique:
+        args.extend(["--time-sec", "5"])  # safe default
 
     if cfg.tampers:
         args.extend(["--tamper", ",".join(cfg.tampers)])

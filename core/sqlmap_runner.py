@@ -4,15 +4,14 @@ Runs the bundled sqlmap (./sqlmap/sqlmap.py) as a subprocess.
 
 One RL step = one sqlmap execution.
 
-Notes:
-- We DO NOT use sqlmap's --output-dir (to avoid writing lots of files)
-- We DO NOT pass --method, because some sqlmap versions (e.g. 1.4.4 stable)
-  don't accept it. For POST requests we pass --data, for GET we embed params
-  into the URL.
+To count HTTP requests accurately, this runner supports sqlmap's traffic log
+option (-t). It will parse the generated log to count requests.
 """
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -34,7 +33,6 @@ class SqlmapRunConfig:
     batch: bool = True
     flush_session: bool = True
     verbosity: int = 1
-    # If provided, will be passed as extra args (e.g. proxy, headers)
     extra_args: Optional[List[str]] = None
 
 
@@ -47,13 +45,21 @@ class SqlmapRunResult:
     stderr: str
     duration_sec: float
     timed_out: bool
+    requests_count: int
+
+
+# Regex to find the start of a request in sqlmap's traffic log file.
+# Format is: "HTTP request #[number]:"
+_RE_REQUEST_START = re.compile(r"^HTTP request #\[\d+\]:", re.MULTILINE)
 
 
 class SqlmapRunner:
     def __init__(self, run_cfg: SqlmapRunConfig):
         self.cfg = run_cfg
 
-    def build_cmd(self, target: SqlmapTarget, argv_options: Sequence[str]) -> List[str]:
+    def build_cmd(
+        self, target: SqlmapTarget, argv_options: Sequence[str], traffic_log_path: Optional[str]
+    ) -> List[str]:
         cmd: List[str] = [
             self.cfg.python_exe,
             self.cfg.sqlmap_script,
@@ -69,14 +75,17 @@ class SqlmapRunner:
         if self.cfg.flush_session:
             cmd.append("--flush-session")
 
+        if traffic_log_path:
+            cmd.extend(["-t", traffic_log_path])
+
         if self.cfg.extra_args:
             cmd.extend(self.cfg.extra_args)
 
         cmd.extend(list(argv_options))
         return cmd
 
-    def run(self, *, target: SqlmapTarget, argv_options: Sequence[str]) -> SqlmapRunResult:
-        cmd = self.build_cmd(target=target, argv_options=argv_options)
+    def run(self, *, target: SqlmapTarget, argv_options: Sequence[str], traffic_log_path: Optional[str] = None) -> SqlmapRunResult:
+        cmd = self.build_cmd(target=target, argv_options=argv_options, traffic_log_path=traffic_log_path)
 
         t0 = time.perf_counter()
         timed_out = False
@@ -100,6 +109,15 @@ class SqlmapRunner:
 
         dt = time.perf_counter() - t0
 
+        req_count = 0
+        if traffic_log_path and os.path.exists(traffic_log_path):
+            try:
+                with open(traffic_log_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                    req_count = len(_RE_REQUEST_START.findall(content))
+            except Exception:
+                pass  # best-effort
+
         cmd_str = " ".join(_shell_quote(x) for x in cmd)
         return SqlmapRunResult(
             cmd=list(cmd),
@@ -109,6 +127,7 @@ class SqlmapRunner:
             stderr=err,
             duration_sec=float(dt),
             timed_out=bool(timed_out),
+            requests_count=int(req_count),
         )
 
 

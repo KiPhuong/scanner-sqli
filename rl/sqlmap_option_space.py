@@ -18,7 +18,7 @@ from typing import List, Optional, Sequence
 class OptionAction:
     """Atomic action applied to config.
 
-    kind:
+    kind (supported):
       - technique
       - level
       - risk
@@ -29,11 +29,14 @@ class OptionAction:
       - random_agent
       - timeout
       - retries
+      - prefix
+      - suffix
       - reset
 
     Notes:
       - Some options (e.g. timeout/retries) are also enforced by the subprocess runner.
         Here they represent *sqlmap-side* knobs.
+      - prefix/suffix are for payload shaping (injection payload prefix/suffix).
     """
 
     kind: str
@@ -59,11 +62,19 @@ def default_option_actions(tampers: Sequence[str]) -> List[OptionAction]:
     for ts in ["3", "5", "8", "10"]:
         actions.append(OptionAction("time_sec", ts))
 
-    # New: random-agent toggle
+    # Payload shaping: prefix/suffix
+    # Keep small, commonly useful set (you can expand later)
+    for p in ["", "'", "\")", "')", "\"", "\\"]:
+        actions.append(OptionAction("prefix", p))
+
+    for s in ["", "-- ", "--", "#", "/*", "*/", ")", "')"]:
+        actions.append(OptionAction("suffix", s))
+
+    # random-agent toggle
     actions.append(OptionAction("random_agent", "on"))
     actions.append(OptionAction("random_agent", "off"))
 
-    # New: sqlmap-side timeout/retries knobs
+    # sqlmap-side timeout/retries knobs
     for t in ["10", "20", "30", "60"]:
         actions.append(OptionAction("timeout", t))
 

