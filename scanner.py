@@ -557,7 +557,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--traffic-log-dir",
-        default=None,
+        default="debug/traffic",
         help="Directory to store sqlmap traffic logs (-t) per run. Enables accurate HTTP request counting.",
     )
     ap.add_argument(

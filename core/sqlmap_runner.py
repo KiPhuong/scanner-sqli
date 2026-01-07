@@ -49,8 +49,8 @@ class SqlmapRunResult:
 
 
 # Regex to find the start of a request in sqlmap's traffic log file.
-# Format is: "HTTP request #[number]:"
-_RE_REQUEST_START = re.compile(r"^HTTP request #\[\d+\]:", re.MULTILINE)
+# Format is: "HTTP request [#<number>]:"
+_RE_REQUEST_START = re.compile(r"^HTTP request (?:#\[\d+\]|\[#\d+\]):", re.MULTILINE)
 
 
 class SqlmapRunner:
@@ -114,7 +114,14 @@ class SqlmapRunner:
             try:
                 with open(traffic_log_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
-                    req_count = len(_RE_REQUEST_START.findall(content))
+
+                # Primary: count entries in sqlmap traffic log
+                req_count = len(_RE_REQUEST_START.findall(content))
+
+                # Fallback: some sqlmap versions/verbosity levels don't emit "HTTP request ..." markers
+                # In that case, count raw request lines (best-effort)
+                if req_count == 0:
+                    req_count = len(re.findall(r"(?im)^(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+\S+\s+HTTP/\d\.\d\s*$", content))
             except Exception:
                 pass  # best-effort
 
