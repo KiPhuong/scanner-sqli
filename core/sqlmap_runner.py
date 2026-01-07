@@ -40,6 +40,9 @@ class SqlmapRunConfig:
 class SqlmapRunResult:
     cmd: List[str]
     cmd_str: str
+    # Convenience: sqlmap invocation without the python interpreter prefix
+    # e.g. "sqlmap/sqlmap.py -u ...". Useful for logging.
+    sqlmap_cmd_str: str
     returncode: int
     stdout: str
     stderr: str
@@ -126,9 +129,18 @@ class SqlmapRunner:
                 pass  # best-effort
 
         cmd_str = " ".join(_shell_quote(x) for x in cmd)
+        # Prefer rendering an end-user-like "sqlmap" command for logs.
+        # cmd structure: [python_exe, sqlmap_script, -u, ...]
+        # For readability we log: sqlmap -u ... (and keep full cmd_str separately)
+        if len(cmd) >= 2 and cmd[1].endswith("sqlmap.py"):
+            sqlmap_cmd_str = "sqlmap " + " ".join(_shell_quote(x) for x in cmd[2:])
+        else:
+            sqlmap_cmd_str = " ".join(_shell_quote(x) for x in cmd[1:])
+
         return SqlmapRunResult(
             cmd=list(cmd),
             cmd_str=cmd_str,
+            sqlmap_cmd_str=sqlmap_cmd_str,
             returncode=rc,
             stdout=out,
             stderr=err,

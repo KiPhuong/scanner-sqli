@@ -201,6 +201,7 @@ def scan(
     blocked_keywords_file: Optional[str] = None,
     traffic_log_dir: Optional[str] = None,
     summary_out: str = "summary.jsonl",
+    crawl: bool = False,
 ) -> List[dict]:
     session = requests.Session()
     session.headers.setdefault("User-Agent", "scanner-sqli-sqlmap-rl/1.0")
@@ -267,7 +268,18 @@ def scan(
 
     reward_cfg = RewardConfig()
 
-    templates: List[RequestTemplate] = crawler.crawl(target_url)
+    templates: List[RequestTemplate]
+    if crawl:
+        templates = crawler.crawl(target_url)
+    else:
+        # No crawling: scan the provided URL directly as a single GET target
+        # (no form extraction). Query parameters come from the URL itself.
+        from urllib.parse import parse_qsl, urlsplit, urlunsplit
+
+        parts = urlsplit(target_url)
+        params = {k: v for k, v in parse_qsl(parts.query, keep_blank_values=True)}
+        base_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
+        templates = [RequestTemplate(url=base_url, method="GET", params=params)]
 
     results: List[dict] = []
 
@@ -289,7 +301,7 @@ def scan(
 
     for tpl in templates:
         base_params = dict(tpl.params)
-        for inject_param in list(base_params.keys()):
+        for inject_param in [k for k in list(base_params.keys()) if k.lower() != "difficulty"]:
             input_key = {
                 "url": tpl.url,
                 "method": tpl.method.upper(),
@@ -401,7 +413,7 @@ def scan(
                             "action_id": int(action_id),
                             "action": {"kind": act.kind, "value": act.value},
                             "argv_opts": argv_opts,
-                            "cmd": run_res.cmd_str,
+                            "cmd": run_res.sqlmap_cmd_str,
                             "run": {
                                 "duration_sec": run_res.duration_sec,
                                 "timed_out": run_res.timed_out,
@@ -433,7 +445,7 @@ def scan(
                         found = True
                         http_requests_to_first_vuln = int(total_http_requests)
                         finding_payload = obs.exploited_payload
-                        finding_cmd = run_res.cmd_str
+                        finding_cmd = run_res.sqlmap_cmd_str
                         finding_episode = ep
                         finding_step = step
 
@@ -542,6 +554,11 @@ def main() -> None:
     ap.add_argument("--timeout-sec", type=int, default=120, help="Timeout per sqlmap run")
     ap.add_argument("--epsilon", type=float, default=0.3)
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument(
+        "--crawl",
+        action="store_true",
+        help="Enable HTML crawling on the target URL (extract forms and query parameters). If omitted, scan the provided -u URL directly without crawling.",
+    )
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--model-in", default=None)
     ap.add_argument("--model-out", default=None)
@@ -582,6 +599,7 @@ def main() -> None:
         blocked_keywords_file=args.blocked_keywords_file,
         traffic_log_dir=args.traffic_log_dir,
         summary_out=args.summary_out,
+        crawl=bool(args.crawl),
     )
 
 
