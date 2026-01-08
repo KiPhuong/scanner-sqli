@@ -124,9 +124,20 @@ class SqlmapRunner:
                 # Fallback: some sqlmap versions/verbosity levels don't emit "HTTP request ..." markers
                 # In that case, count raw request lines (best-effort)
                 if req_count == 0:
-                    req_count = len(re.findall(r"(?im)^(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+\S+\s+HTTP/\d\.\d\s*$", content))
+                    req_count = len(
+                        re.findall(
+                            r"(?im)^(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+\S+\s+HTTP/\d\.\d\s*$",
+                            content,
+                        )
+                    )
             except Exception:
                 pass  # best-effort
+            finally:
+                # Option 3: auto-delete traffic log after we have parsed it
+                try:
+                    os.unlink(traffic_log_path)
+                except Exception:
+                    pass
 
         cmd_str = " ".join(_shell_quote(x) for x in cmd)
         # Prefer rendering an end-user-like "sqlmap" command for logs.
