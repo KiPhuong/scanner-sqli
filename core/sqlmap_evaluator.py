@@ -29,9 +29,12 @@ class RewardConfig:
     timeout_penalty: float = -20.0
     step_penalty: float = -1.0
     runtime_cost: float = -0.2  # per second
+    request_cost: float = -0.05  # per HTTP request (requires traffic log -t)
 
 
-def compute_reward(obs: SqlmapObservation, *, duration_sec: float, cfg: RewardConfig) -> float:
+def compute_reward(
+    obs: SqlmapObservation, *, duration_sec: float, requests_count: int | None = None, cfg: RewardConfig
+) -> float:
     r = 0.0
 
     # base step cost to encourage fewer steps
@@ -39,6 +42,10 @@ def compute_reward(obs: SqlmapObservation, *, duration_sec: float, cfg: RewardCo
 
     # runtime proxy (less time ~= fewer requests)
     r += cfg.runtime_cost * float(duration_sec)
+
+    # Penalty for the number of HTTP requests made in the step
+    if requests_count is not None:
+        r += cfg.request_cost * float(requests_count)
 
     if obs.blocked:
         r += cfg.blocked_penalty

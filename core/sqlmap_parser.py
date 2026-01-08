@@ -30,7 +30,17 @@ class SqlmapObservation:
     raw_snippet: str
 
 
-_RE_INJECTABLE = re.compile(r"(?i)parameter: .*? is vulnerable|is injectable")
+# We want a *reliable* confirmation, not heuristic messages.
+# Prefer sqlmap's final summary section ("sqlmap identified the following injection point(s)")
+# and/or the detailed block containing Parameter/Type/Payload.
+_RE_INJECTABLE_STRONG = re.compile(r"(?is)sqlmap\s+identified\s+the\s+following\s+injection\s+point\(s\)")
+# This regex is now designed to find ANY block that has Type, Title, and Payload, which sqlmap prints for each successful finding.
+_RE_INJECTION_POINT_BLOCK = re.compile(
+    r"(?is)Type:\s*(?P<type>[^\n\r]+)\s*\n\s*Title:\s*(?P<title>[^\n\r]+)\s*\n\s*Payload:\s*(?P<payload>[^\n\r]+)"
+)
+
+# Fallback (less strict): lines like "GET parameter 'id' is vulnerable" or "... is ... injectable"
+_RE_INJECTABLE_FALLBACK = re.compile(r"(?i)\b(GET|POST)\s+parameter\s+'[^']+'\s+(?:appears\s+to\s+be\s+|is\s+).*?\binjectable\b|\bis\s+vulnerable\b")
 _RE_PARAM = re.compile(r"(?i)parameter:\s*([\w\-\[\]\.]+)\s*\((GET|POST)\)")
 _RE_TECHNIQUE = re.compile(r"(?i)Type:\s*(boolean-based blind|error-based|time-based blind|UNION query|stacked queries)")
 _RE_DBMS = re.compile(r"(?i)back-end DBMS:\s*([^\n\r]+)")
@@ -51,21 +61,41 @@ _RE_HTTP_BLOCK = re.compile(r"(?i)\b(403|406|429)\b")
 def parse_sqlmap_output(stdout: str, stderr: str, *, timed_out: bool) -> SqlmapObservation:
     text = (stdout or "") + "\n" + (stderr or "")
 
-    injectable = bool(_RE_INJECTABLE.search(text))
+    # Strong confirmation: look for the final injection point summary block.
+    # Primary confirmation: if sqlmap printed a concrete Payload, treat it as confirmed injectable.
+    # This makes detection robust even if the run is cut short (timeout) before the final summary header.
+    m_point = _RE_INJECTION_POINT_BLOCK.search(text)
+    if m_point:
+        injectable = True
+        payload = m_point.group("payload").strip()
 
-    m_param = _RE_PARAM.search(text)
-    vuln_param = m_param.group(1) if m_param else None
+        # Best-effort: derive technique from the Type line when available
+        technique = m_point.group("type").strip() if m_point.group("type") else None
 
-    m_dbms = _RE_DBMS.search(text)
-    dbms = m_dbms.group(1).strip() if m_dbms else None
+        # Best-effort vulnerable parameter (might be missing depending on where we matched)
+        m_param = _RE_PARAM.search(text)
+        vuln_param = m_param.group(1) if m_param else None
 
-    m_tech = _RE_TECHNIQUE.search(text)
-    technique = m_tech.group(1).strip() if m_tech else None
+        dbms = None
+    else:
+        injectable = bool(_RE_INJECTABLE_STRONG.search(text) or _RE_INJECTABLE_FALLBACK.search(text))
 
-    payload = None
-    m_pay = _RE_PAYLOAD_LINE.search(text)
-    if m_pay:
-        payload = m_pay.group(1).strip()
+        m_param = _RE_PARAM.search(text)
+        vuln_param = m_param.group(1) if m_param else None
+
+        payload = None
+        m_pay = _RE_PAYLOAD_LINE.search(text)
+        if m_pay:
+            payload = m_pay.group(1).strip()
+
+    # If we didn't already extract dbms/technique from the strong block, try best-effort extraction
+    if "dbms" not in locals() or dbms is None:
+        m_dbms = _RE_DBMS.search(text)
+        dbms = m_dbms.group(1).strip() if m_dbms else None
+
+    if "technique" not in locals() or technique is None:
+        m_tech = _RE_TECHNIQUE.search(text)
+        technique = m_tech.group(1).strip() if m_tech else None
 
     blocked = bool(_RE_HTTP_BLOCK.search(text) or _RE_WAF_STRONG.search(text))
 

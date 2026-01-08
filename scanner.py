@@ -251,14 +251,14 @@ def scan(
     blocked_keywords = _load_blocked_keywords(blocked_keywords_file)
     test_skip_regex = _build_test_skip_regex(blocked_keywords)
 
-    extra_args = ["--smart", "--skip-static"]
+    extra_args = ["--batch"]
     if test_skip_regex:
         extra_args.extend(["--test-skip", test_skip_regex])
 
     runner = SqlmapRunner(
         SqlmapRunConfig(
             timeout_sec=timeout_sec,
-            threads=1,
+            #threads=1,
             batch=True,
             flush_session=True,
             verbosity=1,
@@ -378,7 +378,12 @@ def scan(
                     last_duration = float(run_res.duration_sec)
 
                     obs = parse_sqlmap_output(run_res.stdout, run_res.stderr, timed_out=run_res.timed_out)
-                    reward = compute_reward(obs, duration_sec=run_res.duration_sec, cfg=reward_cfg)
+                    reward = compute_reward(
+                        obs,
+                        duration_sec=run_res.duration_sec,
+                        requests_count=run_res.requests_count,
+                        cfg=reward_cfg,
+                    )
 
                     next_state = build_state(
                         obs,
